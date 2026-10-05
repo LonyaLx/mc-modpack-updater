@@ -117,6 +117,55 @@ def _get_mrpack_cache_dir() -> Path:
     return _MRPACK_CACHE_DIR
 
 
+def clear_mrpack_cache() -> int:
+    """清空 Modrinth 下载缓存，返回释放的字节数"""
+    cache_dir = _get_mrpack_cache_dir()
+    freed = 0
+    try:
+        for f in cache_dir.iterdir():
+            try:
+                if f.is_file():
+                    freed += f.stat().st_size
+                    f.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return freed
+
+
+def _enforce_mrpack_cache_limit(max_bytes: int = 2 * 1024 * 1024 * 1024):
+    """把下载缓存控制在 max_bytes 以内，超出时按最久未使用顺序清理"""
+    cache_dir = _get_mrpack_cache_dir()
+    try:
+        entries = []
+        total = 0
+        for f in cache_dir.iterdir():
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if not f.is_file():
+                continue
+            entries.append((st.st_mtime, st.st_size, f))
+            total += st.st_size
+    except OSError:
+        return
+
+    if total <= max_bytes:
+        return
+
+    entries.sort()  # 最旧的先删
+    for _mtime, size, path in entries:
+        if total <= max_bytes:
+            break
+        try:
+            path.unlink()
+            total -= size
+        except OSError:
+            continue
+
+
 def _http_download(url: str, dest: Path, expected_sha1: str = "", timeout: int = 90) -> int:
     """
     流式下载 url 到 dest（先写 .part，校验通过后再改名），返回字节数。
@@ -124,6 +173,11 @@ def _http_download(url: str, dest: Path, expected_sha1: str = "", timeout: int =
     """
     import ssl
     import urllib.request
+
+    # 安全：只允许 http/https，防止清单里塞 file:// 之类的本地协议被读取
+    scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+    if scheme not in ("http", "https"):
+        raise ValueError(f"不支持的下载协议（仅允许 http/https）：{url[:80]}")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = Path(str(dest) + ".part")
@@ -209,15 +263,18 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
 
     total = len(todo)
     if total == 0:
-        return {"ok": [], "failed": [], "skipped": skipped, "missing": []}
+        return {"ok": [], "failed": [], "skipped": skipped, "missing": [], "reasons": {}}
 
     total_bytes = sum(int(i.get("fileSize") or 0) for i in todo)
     log(f"开始下载清单资源：{total} 个文件，约 {format_size(total_bytes)}", "info")
+    log(f"下载缓存目录：{cache_dir}（缓存上限 2GB，超出会自动清理最旧的）", "info")
+    _enforce_mrpack_cache_limit()
 
     done_files = 0
     done_bytes = 0
     ok: List[str] = []
     failed: List[str] = []
+    reasons: Dict[str, str] = {}
     lock = threading.Lock()
 
     def one(item: dict):
@@ -228,7 +285,7 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
 
         # 1) 目标已存在且校验通过 → 跳过
         if dest.is_file() and sha1 and _file_sha1(dest) == sha1:
-            return True, rel, size
+            return True, rel, size, ""
 
         # 2) 命中本地下载缓存
         cache_file = (cache_dir / sha1) if sha1 else None
@@ -236,19 +293,24 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
             if (not sha1) or _file_sha1(cache_file) == sha1:
                 try:
                     _link_or_copy(cache_file, dest)
-                    return True, rel, size
+                    return True, rel, size, ""
                 except OSError:
                     pass
 
         urls = [u for u in (item.get("downloads") or []) if u]
         if not urls:
-            return False, rel, size
+            return False, rel, size, "清单未提供下载地址"
 
-        for _attempt in range(3):
+        last_err = ""
+        for attempt in range(3):
             for url in urls:
                 try:
                     _http_download(url, dest, sha1, timeout=90)
-                except Exception:
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    # 限流 / 服务端临时错误 → 退避后重试
+                    if any(code in last_err for code in ("429", "500", "502", "503", "504")):
+                        time.sleep(1.5 * (attempt + 1))
                     continue
                 # 回写缓存
                 if cache_file is not None:
@@ -257,8 +319,8 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
                             shutil.copy2(dest, cache_file)
                     except OSError:
                         pass
-                return True, rel, size
-        return False, rel, size
+                return True, rel, size, ""
+        return False, rel, size, last_err or "下载失败"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as pool:
         future_map = {pool.submit(one, item): item for item in todo}
@@ -266,11 +328,13 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
             item = future_map[fut]
             rel = str(item.get("path") or "").replace("\\", "/")
             size = int(item.get("fileSize") or 0)
+            reason = ""
             try:
-                success, rel, size = fut.result()
+                success, rel, size, reason = fut.result()
             except Exception as e:
                 log(f"下载异常 {rel}: {e}", "warning")
                 success = False
+                reason = f"{type(e).__name__}: {e}"
 
             with lock:
                 done_files += 1
@@ -279,7 +343,8 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
                     ok.append(rel)
                 else:
                     failed.append(rel)
-                    log(f"下载失败：{rel}", "warning")
+                    reasons[rel] = reason
+                    log(f"下载失败：{rel}（{reason}）", "warning")
 
                 if total_bytes > 0:
                     progress(done_bytes, total_bytes,
@@ -298,7 +363,8 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
         if not (target_root / rel).is_file():
             missing.append(rel)
 
-    return {"ok": ok, "failed": failed, "skipped": skipped, "missing": missing}
+    return {"ok": ok, "failed": failed, "skipped": skipped,
+            "missing": missing, "reasons": reasons}
 
 
 def _assemble_mrpack(raw_root: Path, index_file: Path,
@@ -346,14 +412,28 @@ def _assemble_mrpack(raw_root: Path, index_file: Path,
     # 2) 清单声明的资源（需要联网下载）
     files = data.get("files") or []
     if files:
+        # 磁盘空间预检查：避免下载到一半才发现空间不足
+        need = sum(int(f.get("fileSize") or 0) for f in files)
+        try:
+            free = shutil.disk_usage(str(merged)).free
+            if need and free < need * 1.3:
+                raise ValueError(
+                    f"临时盘空间不足：本次需要约 {format_size(int(need * 1.3))}，"
+                    f"当前可用 {format_size(free)}。请清理磁盘后重试。"
+                )
+        except OSError:
+            pass
+
         result = _download_mrpack_files(files, merged, log, progress)
         if result.get("missing"):
             log(f"注意：有 {len(result['missing'])} 个清单文件最终缺失，"
                 f"可能导致游戏启动失败（可重试检测以重新下载）", "warning")
         if result.get("failed"):
+            first = result["failed"][0]
+            why = (result.get("reasons") or {}).get(first, "未知原因")
             raise ValueError(
-                f"有 {len(result['failed'])} 个资源下载失败（网络问题？），"
-                f"请检查网络后重试。首个失败：{result['failed'][0]}"
+                f"有 {len(result['failed'])} 个资源下载失败，请检查网络后重试。\n"
+                f"首个失败：{first}\n失败原因：{why}"
             )
     else:
         log("清单中未声明需下载的文件", "info")
@@ -470,6 +550,7 @@ class SimpleUpdater:
         "*.log",
         "*.log.gz",
         "*.tmp",
+        "*.part",            # 下载中断残留的临时文件
         ".DS_Store",
         "Thumbs.db",
         "desktop.ini",
@@ -996,27 +1077,59 @@ class SimpleUpdater:
     def is_game_running() -> bool:
         """
         检测 Minecraft 游戏是否正在运行。
-        通过检查 javaw.exe / java.exe 进程 + 典型的 Minecraft 类路径来判断。
+
+        注意：Windows 11 24H2 起已移除 wmic，不能再用它作为唯一手段。
+        这里依次使用：tasklist（判断有无 java 进程）
+                    → PowerShell CIM / wmic（取命令行判断是不是 Minecraft）
+                    → 进程窗口标题兜底。
+        全部手段都失败时返回 False（不阻塞用户），避免误报。
         """
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["wmic", "process", "where",
-                 "name='javaw.exe' or name='java.exe'",
-                 "get", "commandline"],
-                capture_output=True, text=True, timeout=5
-            )
-            output = result.stdout.lower()
-            # 检查是否包含 Minecraft 相关特征
-            mc_keywords = ["minecraft", "net.minecraft", "mclauncher",
-                           ".minecraft", "hmcl", "pcl2", "bakaxl"]
-            for kw in mc_keywords:
-                if kw in output:
-                    return True
+        import subprocess
+
+        def _run(args, timeout=12) -> str:
+            try:
+                r = subprocess.run(
+                    args, capture_output=True, text=True, timeout=timeout,
+                    encoding="utf-8", errors="ignore",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                return (r.stdout or "") + (r.stderr or "")
+            except Exception:
+                return ""
+
+        keywords = ("minecraft", ".minecraft", "hmcl", "pcl2", "bakaxl",
+                    "neoforge", "forge", "fabric")
+
+        # 1) 先看有没有 java 进程（tasklist 所有 Windows 都有）
+        proc_list = _run(["tasklist"]).lower()
+        if "javaw.exe" not in proc_list and "java.exe" not in proc_list:
             return False
-        except Exception:
-            # 检测失败就不阻止，避免误报
-            return False
+
+        # 2) 取命令行判断是不是 Minecraft（PowerShell CIM）
+        cmdline = _run([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='javaw.exe' or Name='java.exe'\""
+            " | Select-Object -ExpandProperty CommandLine"
+        ]).lower()
+        if cmdline.strip():
+            return any(kw in cmdline for kw in keywords)
+
+        # 3) 老系统退路：wmic
+        wmic_out = _run([
+            "wmic", "process", "where",
+            "name='javaw.exe' or name='java.exe'", "get", "commandline"
+        ]).lower()
+        if wmic_out.strip():
+            return any(kw in wmic_out for kw in keywords)
+
+        # 4) 都取不到命令行：用「java 进程有没有可见窗口」兜底
+        titles = _run([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-Process javaw,java -ErrorAction SilentlyContinue"
+            " | Where-Object { $_.MainWindowTitle }"
+            " | Select-Object -ExpandProperty MainWindowTitle"
+        ])
+        return bool(titles.strip())
 
     def detect_required_neoforge(self, pack_dir: Path = None) -> Dict:
         """
