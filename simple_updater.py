@@ -9,25 +9,49 @@ import json
 import hashlib
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable
 
-# 压缩包解压缓存：{(压缩包路径, 修改时间, 大小): 解压目录}
-# 同一个压缩包只解压一次，检测/更新/回退过程中重复使用
+# ==================== 压缩包 / Modrinth(mrpack) 支持 ====================
+
+# 最终“整合包根目录”缓存：{(压缩包路径, 修改时间, 大小): 目录}
+# 同一个压缩包只处理一次，检测 / 更新 / 回退过程中重复使用
 _ZIP_EXTRACT_CACHE: Dict[tuple, Path] = {}
+
+# Modrinth 清单元信息缓存：{同上 key: {name, version_id, minecraft, loaders}}
+_MRPACK_META_CACHE: Dict[tuple, dict] = {}
+
+# 本程序创建的所有临时目录（退出时统一清理）
+_TEMP_DIRS: List[Path] = []
+
+# Modrinth 整合包清单文件名
+MRPACK_MANIFEST_NAME = "modrinth.index.json"
+
+# 支持直接选择的压缩包后缀
+ARCHIVE_SUFFIXES = (".zip", ".mrpack")
+
+# Modrinth 资源下载缓存目录（按文件 SHA1 命名，可跨次运行复用）
+_MRPACK_CACHE_DIR: Optional[Path] = None
+
+# 并发下载线程数
+_DOWNLOAD_WORKERS = 8
 
 
 def cleanup_zip_cache():
-    """删除所有压缩包解压出来的临时目录（程序退出时调用）"""
-    for path in list(_ZIP_EXTRACT_CACHE.values()):
+    """删除所有压缩包解压 / 下载产生的临时目录（程序退出时调用）"""
+    for path in list(_TEMP_DIRS):
         try:
             if path.exists():
                 shutil.rmtree(path, ignore_errors=True)
         except OSError:
             pass
+    _TEMP_DIRS.clear()
     _ZIP_EXTRACT_CACHE.clear()
+    _MRPACK_META_CACHE.clear()
 
 
 def _cache_key(zip_path: Path) -> tuple:
@@ -38,23 +62,335 @@ def _cache_key(zip_path: Path) -> tuple:
         return (str(zip_path), 0, 0)
 
 
-def _extract_zip_to_temp(zip_path: Path, log_callback=None, progress_callback=None) -> Path:
+def _new_temp_dir(prefix: str) -> Path:
+    """创建并登记一个临时目录"""
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    _TEMP_DIRS.append(path)
+    return path
+
+
+def _version_tuple(text) -> tuple:
+    """把版本字符串转成可比较的数字元组，如 '21.1.250' -> (21, 1, 250)"""
+    import re
+    parts = re.findall(r'\d+', str(text or ""))
+    return tuple(int(p) for p in parts[:3]) if parts else (0,)
+
+
+def _file_sha1(path: Path) -> Optional[str]:
+    """计算文件 SHA1（Modrinth 清单使用的就是 sha1）"""
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 256)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _link_or_copy(src: Path, dst: Path):
+    """优先硬链接（同盘符零额外占用），失败则复制"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+    try:
+        os.link(str(src), str(dst))
+        return
+    except OSError:
+        pass
+    shutil.copy2(src, dst)
+
+
+def _get_mrpack_cache_dir() -> Path:
+    """Modrinth 下载缓存目录（放在系统临时目录，可跨次运行复用）"""
+    global _MRPACK_CACHE_DIR
+    if _MRPACK_CACHE_DIR is None or not _MRPACK_CACHE_DIR.exists():
+        d = Path(tempfile.gettempdir()) / "mc_updater_downloads"
+        d.mkdir(parents=True, exist_ok=True)
+        _MRPACK_CACHE_DIR = d
+    return _MRPACK_CACHE_DIR
+
+
+def _http_download(url: str, dest: Path, expected_sha1: str = "", timeout: int = 90) -> int:
     """
-    把整合包压缩包解压到临时目录（带缓存），返回解压后的根目录。
-    同一个压缩包只会解压一次。
+    流式下载 url 到 dest（先写 .part，校验通过后再改名），返回字节数。
+    校验失败会抛 ValueError。
+    """
+    import ssl
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = Path(str(dest) + ".part")
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "MCModpackUpdater/1.0 (+modpack incremental updater)"}
+    )
+
+    def _open(ctx=None):
+        if ctx is None:
+            return urllib.request.urlopen(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+    try:
+        resp = _open()
+    except ssl.SSLError:
+        # 少数系统缺少根证书，降级重试
+        resp = _open(ssl._create_unverified_context())
+
+    total = 0
+    try:
+        with resp, open(part, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+
+        if expected_sha1:
+            actual = _file_sha1(part)
+            if actual != expected_sha1:
+                raise ValueError(f"哈希校验失败（期望 {expected_sha1[:8]}…，实际 {str(actual)[:8]}…）")
+
+        os.replace(str(part), str(dest))
+    except BaseException:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
+        raise
+
+    return total
+
+
+def _find_mrpack_index(root: Path) -> Optional[Path]:
+    """在解压根目录（或下一层）寻找 modrinth.index.json"""
+    direct = root / MRPACK_MANIFEST_NAME
+    if direct.is_file():
+        return direct
+    try:
+        for child in root.iterdir():
+            if child.is_dir():
+                candidate = child / MRPACK_MANIFEST_NAME
+                if candidate.is_file():
+                    return candidate
+    except OSError:
+        pass
+    return None
+
+
+def _download_mrpack_files(files: List[dict], target_root: Path,
+                           log_callback=None, progress_callback=None) -> Dict:
+    """
+    按 Modrinth 清单并发下载所有声明文件到 target_root。
+    :return: {"ok": [...], "failed": [...], "skipped": [...], "missing": [...]}
+    """
+    log = log_callback or (lambda *a: None)
+    progress = progress_callback or (lambda *a: None)
+    cache_dir = _get_mrpack_cache_dir()
+
+    todo: List[dict] = []
+    skipped: List[str] = []
+    for item in files or []:
+        rel = str(item.get("path") or "").replace("\\", "/")
+        env = item.get("env") or {}
+        if str(env.get("client", "")).lower() == "unsupported":
+            skipped.append(rel)
+            continue
+        if not rel:
+            continue
+        todo.append(item)
+
+    total = len(todo)
+    if total == 0:
+        return {"ok": [], "failed": [], "skipped": skipped, "missing": []}
+
+    total_bytes = sum(int(i.get("fileSize") or 0) for i in todo)
+    log(f"开始下载清单资源：{total} 个文件，约 {format_size(total_bytes)}", "info")
+
+    done_files = 0
+    done_bytes = 0
+    ok: List[str] = []
+    failed: List[str] = []
+    lock = threading.Lock()
+
+    def one(item: dict):
+        rel = str(item.get("path") or "").replace("\\", "/")
+        dest = target_root / rel
+        sha1 = str((item.get("hashes") or {}).get("sha1") or "").lower()
+        size = int(item.get("fileSize") or 0)
+
+        # 1) 目标已存在且校验通过 → 跳过
+        if dest.is_file() and sha1 and _file_sha1(dest) == sha1:
+            return True, rel, size
+
+        # 2) 命中本地下载缓存
+        cache_file = (cache_dir / sha1) if sha1 else None
+        if cache_file is not None and cache_file.is_file():
+            if (not sha1) or _file_sha1(cache_file) == sha1:
+                try:
+                    _link_or_copy(cache_file, dest)
+                    return True, rel, size
+                except OSError:
+                    pass
+
+        urls = [u for u in (item.get("downloads") or []) if u]
+        if not urls:
+            return False, rel, size
+
+        for _attempt in range(3):
+            for url in urls:
+                try:
+                    _http_download(url, dest, sha1, timeout=90)
+                except Exception:
+                    continue
+                # 回写缓存
+                if cache_file is not None:
+                    try:
+                        if not (cache_file.is_file() and _file_sha1(cache_file) == sha1):
+                            shutil.copy2(dest, cache_file)
+                    except OSError:
+                        pass
+                return True, rel, size
+        return False, rel, size
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as pool:
+        future_map = {pool.submit(one, item): item for item in todo}
+        for fut in concurrent.futures.as_completed(future_map):
+            item = future_map[fut]
+            rel = str(item.get("path") or "").replace("\\", "/")
+            size = int(item.get("fileSize") or 0)
+            try:
+                success, rel, size = fut.result()
+            except Exception as e:
+                log(f"下载异常 {rel}: {e}", "warning")
+                success = False
+
+            with lock:
+                done_files += 1
+                done_bytes += size
+                if success:
+                    ok.append(rel)
+                else:
+                    failed.append(rel)
+                    log(f"下载失败：{rel}", "warning")
+
+                if total_bytes > 0:
+                    progress(done_bytes, total_bytes,
+                             f"下载整合包资源 {done_files}/{total}：{Path(rel).name}")
+                else:
+                    progress(done_files, total,
+                             f"下载整合包资源 {done_files}/{total}：{Path(rel).name}")
+
+    level = "info" if not failed else "warning"
+    log(f"资源下载完成：成功 {len(ok)} 个，失败 {len(failed)} 个", level)
+
+    # 校验清单里声明但最终缺失的文件（通常是清单自带、或下载失败）
+    missing = []
+    for item in todo:
+        rel = str(item.get("path") or "").replace("\\", "/")
+        if not (target_root / rel).is_file():
+            missing.append(rel)
+
+    return {"ok": ok, "failed": failed, "skipped": skipped, "missing": missing}
+
+
+def _assemble_mrpack(raw_root: Path, index_file: Path,
+                     log_callback=None, progress_callback=None) -> Tuple[Path, Dict]:
+    """
+    把 Modrinth 整合包组装成一个完整的整合包根目录：
+      overrides/ 内容 + 清单里声明的全部资源（联网下载）
+    :return: (整合包根目录, 清单元信息)
     """
     log = log_callback or (lambda *a: None)
     progress = progress_callback or (lambda *a: None)
 
-    key = _cache_key(zip_path)
+    try:
+        data = json.loads(index_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"Modrinth 整合包清单解析失败：{e}")
+
+    pack_name = data.get("name") or "Modrinth 整合包"
+    pack_ver = data.get("versionId") or data.get("version") or ""
+    deps = data.get("dependencies") or {}
+    game_ver = deps.get("minecraft", "")
+    loaders = {}
+    for key in ("neoforge", "forge", "fabric-loader", "quilt-loader"):
+        if deps.get(key):
+            loaders[key] = deps[key]
+    loader_text = "、".join(f"{k} {v}" for k, v in loaders.items())
+
+    log(f"检测到 Modrinth 整合包：{pack_name} {pack_ver}"
+        f"（MC {game_ver} {loader_text}）", "info")
+
+    merged = _new_temp_dir("mc_mrpack_")
+
+    # 1) overrides 里的内容（config / kubejs / 本地自有 mod 等）
+    overrides = raw_root / "overrides"
+    if overrides.is_dir():
+        moved = 0
+        for item in overrides.iterdir():
+            try:
+                shutil.move(str(item), str(merged / item.name))
+                moved += 1
+            except (OSError, shutil.Error) as e:
+                log(f"合并 overrides 失败 {item.name}: {e}", "warning")
+        log(f"已合并 overrides 内容：{moved} 项", "info")
+
+    # 2) 清单声明的资源（需要联网下载）
+    files = data.get("files") or []
+    if files:
+        result = _download_mrpack_files(files, merged, log, progress)
+        if result.get("missing"):
+            log(f"注意：有 {len(result['missing'])} 个清单文件最终缺失，"
+                f"可能导致游戏启动失败（可重试检测以重新下载）", "warning")
+        if result.get("failed"):
+            raise ValueError(
+                f"有 {len(result['failed'])} 个资源下载失败（网络问题？），"
+                f"请检查网络后重试。首个失败：{result['failed'][0]}"
+            )
+    else:
+        log("清单中未声明需下载的文件", "info")
+
+    meta = {
+        "name": pack_name,
+        "version_id": pack_ver,
+        "minecraft": game_ver,
+        "loaders": loaders,
+        "file_count": len(files),
+    }
+    return merged, meta
+
+
+def _prepare_new_pack(archive: Path, log_callback=None,
+                      progress_callback=None) -> Tuple[Path, Optional[Dict]]:
+    """
+    把“新版本压缩包”处理成可直接对比的整合包根目录：
+      - 普通 zip：解压后交给 _resolve_pack_root 继续识别（含套壳 / overrides）
+      - Modrinth 整合包（.mrpack 或含 modrinth.index.json 的 zip）：
+        自动下载清单里声明的全部模组，再与 overrides 合并
+    同一个压缩包只处理一次。
+    :return: (整合包根目录, Modrinth 元信息或 None)
+    """
+    log = log_callback or (lambda *a: None)
+    progress = progress_callback or (lambda *a: None)
+
+    key = _cache_key(archive)
     cached = _ZIP_EXTRACT_CACHE.get(key)
     if cached and cached.exists():
-        return cached
+        return cached, _MRPACK_META_CACHE.get(key)
 
-    temp_root = Path(tempfile.mkdtemp(prefix="mc_pack_"))
-    log(f"正在解压新版本压缩包：{zip_path.name}", "info")
+    temp_root = _new_temp_dir("mc_pack_")
+    total = 0
+    log(f"正在解压新版本压缩包：{archive.name}", "info")
     try:
-        with zipfile.ZipFile(zip_path) as zf:
+        with zipfile.ZipFile(archive) as zf:
             members = zf.infolist()
             total = len(members)
             for i, member in enumerate(members, 1):
@@ -70,9 +406,31 @@ def _extract_zip_to_temp(zip_path: Path, log_callback=None, progress_callback=No
         log(f"解压失败：{e}", "error")
         raise ValueError(f"压缩包解压失败：{e}")
 
-    log(f"解压完成，共 {total} 个文件", "info")
-    _ZIP_EXTRACT_CACHE[key] = temp_root
-    return temp_root
+    meta: Optional[Dict] = None
+    index_file = _find_mrpack_index(temp_root)
+    if index_file is not None:
+        index_dir = index_file.parent
+        final_root, meta = _assemble_mrpack(index_dir, index_file, log, progress)
+        _MRPACK_META_CACHE[key] = meta
+        # 原始解压目录已经没用了（overrides 已移走）
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            if temp_root in _TEMP_DIRS:
+                _TEMP_DIRS.remove(temp_root)
+        except OSError:
+            pass
+    else:
+        log(f"解压完成，共 {total} 个文件", "info")
+        final_root = temp_root
+
+    _ZIP_EXTRACT_CACHE[key] = final_root
+    return final_root, meta
+
+
+def _extract_zip_to_temp(zip_path: Path, log_callback=None, progress_callback=None) -> Path:
+    """兼容旧调用：把压缩包处理成整合包根目录"""
+    return _prepare_new_pack(zip_path, log_callback, progress_callback)[0]
+
 
 
 class SimpleUpdater:
@@ -234,15 +592,15 @@ class SimpleUpdater:
         self.progress_callback = progress_callback or (lambda *a: None)
         self.log_callback = log_callback or (lambda *a: None)
 
-        # 新版本支持直接选择压缩包（.zip）：自动解压到临时目录后再对比
+        # 新版本支持直接选择压缩包：
+        #   - .zip    普通整合包，自动解压
+        #   - .mrpack Modrinth 整合包，自动下载清单里声明的模组
+        self.mrpack_meta: Optional[dict] = None
         new_path = Path(new_dir).resolve()
-        try:
-            if new_path.is_file() and new_path.suffix.lower() == ".zip":
-                new_path = _extract_zip_to_temp(
-                    new_path, self.log_callback, self.progress_callback
-                )
-        except OSError:
-            pass
+        if new_path.is_file() and new_path.suffix.lower() in ARCHIVE_SUFFIXES:
+            new_path, self.mrpack_meta = _prepare_new_pack(
+                new_path, self.log_callback, self.progress_callback
+            )
 
         # 自动识别整合包真实根目录（CurseForge overrides 外壳 / 启动器版本隔离）
         self.old_dir, self._old_root_note = self._resolve_pack_root(Path(old_dir).resolve())
@@ -469,6 +827,27 @@ class SimpleUpdater:
             except OSError:
                 continue
 
+        # 启动器实例目录（PCL/HMCL 版本隔离）：<实例名>.json 里记录了加载器版本
+        try:
+            for js in sorted(pack_dir.glob("*.json")):
+                try:
+                    text = js.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                for pattern in (
+                    r'neoforged:neoforge:(\d+\.\d+[\.\d]*)',
+                    r'neoforge[-_](\d+\.\d+[\.\d]*)',
+                ):
+                    m = re.search(pattern, text)
+                    if m:
+                        return m.group(1)
+                if not version:
+                    m = re.search(r'minecraftforge:forge:(\d+\.\d+[\.\d]*)', text)
+                    if m:
+                        version = m.group(1)
+        except OSError:
+            pass
+
         return version
 
     def detect_fabric_version(self, pack_dir: Path = None) -> Optional[str]:
@@ -504,6 +883,19 @@ class SimpleUpdater:
                         return m.group(1)
             except OSError:
                 continue
+
+        # 启动器实例目录：<实例名>.json 里记录了 fabric-loader 版本
+        try:
+            for js in sorted(pack_dir.glob("*.json")):
+                try:
+                    text = js.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                m = re.search(r'fabricmc:fabric-loader:(\d+[\.\d]+)', text)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
 
         return None
 
@@ -782,9 +1174,31 @@ class SimpleUpdater:
             new_nf_required = new_nf_result.get("version")
             demanding_mods = new_nf_result.get("demanding_mods", [])
 
+            # Modrinth 清单里声明的加载器版本是作者明确写明的，优先采用；
+            # 只有当某个模组要求“更高”的版本时，才改用模组的要求
+            declared_loaders = (self.mrpack_meta or {}).get("loaders") or {}
+            declared_nf = declared_loaders.get("neoforge") or declared_loaders.get("forge")
+            declared_nf_source = False
+            if declared_nf and (
+                not new_nf_required
+                or _version_tuple(new_nf_required) <= _version_tuple(declared_nf)
+            ):
+                new_nf_required = declared_nf
+                declared_nf_source = True
+
+            # 兜底：新版本整合包自带的加载器版本（文件夹形式也适用）
+            if not new_nf_required:
+                new_installed = self.detect_neoforge_version(self.new_dir)
+                if new_installed:
+                    new_nf_required = new_installed
+                    declared_nf = new_installed
+                    declared_nf_source = True
+
             neoforge_info = {
                 "old_version": old_nf,
                 "new_required": new_nf_required,
+                "declared_version": declared_nf,
+                "declared_source": declared_nf_source,
                 "demanding_mods": demanding_mods,
                 "status": "ok",  # ok / too_low / too_high / unknown_old / unknown_new / mismatch
                 "message": "",
@@ -837,9 +1251,28 @@ class SimpleUpdater:
             new_fabric_required = new_fabric_result.get("version")
             demanding_mods_f = new_fabric_result.get("demanding_mods", [])
 
+            declared_fb = (self.mrpack_meta or {}).get("loaders", {}).get("fabric-loader")
+            declared_fb_source = False
+            if declared_fb and (
+                not new_fabric_required
+                or _version_tuple(new_fabric_required) <= _version_tuple(declared_fb)
+            ):
+                new_fabric_required = declared_fb
+                declared_fb_source = True
+
+            # 兜底：新版本整合包自带的 Fabric Loader 版本
+            if not new_fabric_required:
+                new_fb_installed = self.detect_fabric_version(self.new_dir)
+                if new_fb_installed:
+                    new_fabric_required = new_fb_installed
+                    declared_fb = new_fb_installed
+                    declared_fb_source = True
+
             fabric_info = {
                 "old_version": old_fabric,
                 "new_required": new_fabric_required,
+                "declared_version": declared_fb,
+                "declared_source": declared_fb_source,
                 "demanding_mods": demanding_mods_f,
                 "status": "ok",
                 "message": "",
@@ -895,6 +1328,7 @@ class SimpleUpdater:
             "new_count": len(new_files),
             "neoforge": neoforge_info,
             "fabric": fabric_info,
+            "mrpack": self.mrpack_meta,
         }
 
     def _backup_before_update(self, changes: Dict) -> str:

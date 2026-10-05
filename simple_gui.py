@@ -767,8 +767,8 @@ class SimpleUpdaterApp:
                    color=AETheme.NEON_CYAN, width=90, height=28,
                    bg=AETheme.BG_PANEL).pack(side=tk.LEFT)
 
-        NeonButton(row2, text="选 .zip 压缩包", command=self._browse_new_zip,
-                   color=AETheme.NEON_PURPLE, width=110, height=28,
+        NeonButton(row2, text="选压缩包", command=self._browse_new_zip,
+                   color=AETheme.NEON_PURPLE, width=100, height=28,
                    bg=AETheme.BG_PANEL).pack(side=tk.LEFT, padx=(6, 0))
 
         # 选项行
@@ -798,9 +798,10 @@ class SimpleUpdaterApp:
                  font=("Segoe UI Emoji", 11)).pack(side=tk.LEFT, padx=(0, 6))
         tk.Label(
             tip_frame,
-            text="新版本支持直接选择 .zip 压缩包，程序自动解压；存档(saves)、资源包等用户数据永远保留",
+            text="新版本可选：文件夹 / .zip / Modrinth 整合包（.mrpack）——程序自动解压并下载所需模组；"
+                 "存档(saves)、资源包等用户数据永远保留",
             bg=AETheme.BG_PANEL, fg=AETheme.TEXT_MUTED,
-            font=AETheme.FONT_SMALL, wraplength=600, justify="left"
+            font=AETheme.FONT_SMALL, wraplength=620, justify="left"
         ).pack(side=tk.LEFT)
 
     def _build_step2(self, parent):
@@ -1015,7 +1016,12 @@ class SimpleUpdaterApp:
     def _browse_new_zip(self):
         path = filedialog.askopenfilename(
             title="选择新版本整合包压缩包",
-            filetypes=[("整合包压缩包", "*.zip"), ("所有文件", "*.*")]
+            filetypes=[
+                ("整合包（zip / mrpack）", "*.zip *.mrpack"),
+                ("普通压缩包 zip", "*.zip"),
+                ("Modrinth 整合包 mrpack", "*.mrpack"),
+                ("所有文件", "*.*"),
+            ]
         )
         if path:
             self.new_dir_var.set(path)
@@ -1043,11 +1049,11 @@ class SimpleUpdaterApp:
         if not new_path.exists():
             AEDialog.show_error(self.root, "错误", f"新版本路径不存在:\n{new_dir}")
             return
-        if new_path.is_file() and new_path.suffix.lower() != ".zip":
+        if new_path.is_file() and new_path.suffix.lower() not in (".zip", ".mrpack"):
             AEDialog.show_error(
                 self.root,
                 "错误",
-                "新版本请选择「文件夹」或「.zip 压缩包」！\n"
+                "新版本请选择「文件夹」、「.zip」或 Modrinth 整合包「.mrpack」！\n"
                 "（.7z / .rar 格式请先解压，再选择解压出来的文件夹）"
             )
             return
@@ -1099,6 +1105,15 @@ class SimpleUpdaterApp:
         self.stat_preserve_var.set(f"保留配置: {preserve}")
 
         self._show_details(changes)
+
+        # Modrinth 整合包信息
+        if changes.get("mrpack"):
+            mp = changes["mrpack"]
+            self._log(
+                f"✓ Modrinth 整合包：{mp.get('name', '')} {mp.get('version_id', '')}"
+                f"，已自动获取 {mp.get('file_count', 0)} 个清单资源",
+                "info"
+            )
 
         # NeoForge 版本检测：根据状态给出对应提示
         nf = changes.get("neoforge", {})
@@ -1234,6 +1249,25 @@ class SimpleUpdaterApp:
         self.detail_text.insert(tk.END, f"   旧版本文件数: {changes.get('old_count', 0)}\n")
         self.detail_text.insert(tk.END, f"   新版本文件数: {changes.get('new_count', 0)}\n")
         self.detail_text.insert(tk.END, f"   下载大小: {format_size(changes.get('total_size', 0))}\n")
+
+        # Modrinth 整合包信息
+        mp = changes.get("mrpack")
+        if mp:
+            loaders = mp.get("loaders") or {}
+            self.detail_text.insert(tk.END, "\n// ======== Modrinth 整合包 ========\n", "title")
+            self.detail_text.insert(tk.END, f"   名称: {mp.get('name', '')}\n")
+            self.detail_text.insert(tk.END, f"   版本: {mp.get('version_id', '')}\n")
+            self.detail_text.insert(tk.END, f"   游戏版本: {mp.get('minecraft', '')}\n")
+            if loaders:
+                self.detail_text.insert(
+                    tk.END,
+                    "   加载器: " + "、".join(f"{k} {v}" for k, v in loaders.items()) + "\n"
+                )
+            self.detail_text.insert(
+                tk.END,
+                f"   ✓ 已自动下载清单资源 {mp.get('file_count', 0)} 个\n",
+                "preserve"
+            )
 
         # NeoForge 版本信息
         nf = changes.get("neoforge", {})
