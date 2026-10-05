@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import ctypes
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
@@ -578,6 +579,36 @@ def make_circle_avatar(image_path: str, size: int = 64, glow_color: str = AEThem
 
 # ==================== 主应用 ====================
 
+def _resolve_app_dirs():
+    """
+    返回 (资源目录, 配置目录)。
+
+    打包成单文件 EXE 后，__file__ 指向的是临时解压目录，
+    把配置写在里面会导致「关掉程序配置就丢」——所以这里分开处理：
+      · 资源目录：打包后是临时解压目录(_MEIPASS)，开发时是脚本目录（avatar.png 在这）
+      · 配置目录：优先 EXE 所在目录（绿色版）；不可写时退回 %APPDATA%
+    """
+    if getattr(sys, "frozen", False):
+        resource_dir = Path(getattr(sys, "_MEIPASS", None) or Path(sys.executable).parent)
+        exe_dir = Path(sys.executable).resolve().parent
+        config_dir = exe_dir
+        try:
+            probe = exe_dir / ".write_test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError:
+            base = os.environ.get("APPDATA") or str(Path.home())
+            config_dir = Path(base) / "MCModpackUpdater"
+            try:
+                config_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                config_dir = Path(tempfile.gettempdir())
+    else:
+        resource_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        config_dir = resource_dir
+    return resource_dir, config_dir
+
+
 class SimpleUpdaterApp:
     """AE风格整合包更新器"""
 
@@ -600,8 +631,8 @@ class SimpleUpdaterApp:
         self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
         self.root.minsize(min_w, min_h)
 
-        # 配置
-        self.config_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        # 配置（打包成 EXE 后不能写在临时解压目录里，否则重启就丢）
+        self.resource_dir, self.config_dir = _resolve_app_dirs()
         self.config_file = self.config_dir / "updater_config.json"
         self.config = self._load_config()
 
@@ -685,7 +716,7 @@ class SimpleUpdaterApp:
         header.pack(fill=tk.X, padx=16, pady=(16, 12))
 
         # 左侧：头像
-        avatar_path = str(self.config_dir / "avatar.png")
+        avatar_path = str(self.resource_dir / "avatar.png")
         self._avatar_img = make_circle_avatar(avatar_path, size=64, glow_color=AETheme.NEON_CYAN)
 
         avatar_frame = tk.Frame(header, bg=AETheme.BG_MAIN)
@@ -1819,7 +1850,7 @@ class SimpleUpdaterApp:
 
         dialog = tk.Toplevel(self.root)
         dialog.title("版本回退")
-        dialog.geometry("480x400")
+        dialog.geometry("560x460")
         dialog.configure(bg=AETheme.BG_MAIN)
         dialog.transient(self.root)
         # 先隐藏
@@ -1852,6 +1883,14 @@ class SimpleUpdaterApp:
         for b in backups:
             lb.insert(tk.END, f"{b['time']}  (用户配置:{b['user_files']}  删除文件:{b['removed_files']})")
 
+        tk.Label(
+            dialog,
+            text=f"备份共占用 {format_size(updater.backup_total_size())}"
+                 f"（更新成功后会自动只保留最近 {SimpleUpdater.BACKUP_KEEP} 份）",
+            bg=AETheme.BG_MAIN, fg=AETheme.TEXT_SECONDARY,
+            font=AETheme.FONT_SMALL
+        ).pack(anchor=tk.W, padx=20, pady=(8, 0))
+
         btn_frame = tk.Frame(dialog, bg=AETheme.BG_MAIN)
         btn_frame.pack(fill=tk.X, padx=20, pady=20)
 
@@ -1866,28 +1905,52 @@ class SimpleUpdaterApp:
             dialog.destroy()
             self._do_rollback_threaded(backup_name)
 
+        def do_cleanup():
+            keep = SimpleUpdater.BACKUP_KEEP
+            if not AEDialog.ask_yesno(
+                dialog, "清理旧备份",
+                f"只保留最近 {keep} 份备份，更旧的会被删除。\n"
+                f"删除后将无法再回退到那些版本，确定继续吗？"
+            ):
+                return
+            removed = updater.keep_backups(keep)
+            dialog.destroy()
+            AEDialog.show_info(
+                self.root, "清理完成",
+                f"已清理 {len(removed)} 份旧备份，"
+                f"当前备份占用 {format_size(updater.backup_total_size())}。"
+            )
+
         NeonButton(
             btn_frame, text="↩  回退",
             command=do_rollback,
             color=AETheme.NEON_YELLOW,
-            width=120, height=36,
+            width=110, height=36,
             bg=AETheme.BG_MAIN
         ).pack(side=tk.LEFT)
+
+        NeonButton(
+            btn_frame, text="清理旧备份",
+            command=do_cleanup,
+            color=AETheme.TEXT_SECONDARY,
+            width=130, height=36,
+            bg=AETheme.BG_MAIN
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         NeonButton(
             btn_frame, text="取消",
             command=dialog.destroy,
             color=AETheme.TEXT_SECONDARY,
-            width=100, height=36,
+            width=90, height=36,
             bg=AETheme.BG_MAIN
         ).pack(side=tk.RIGHT)
 
         # UI 构建完成后显示
         dialog.update_idletasks()
         # 居中
-        x = self.root.winfo_x() + (self.root.winfo_width() - 480) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 400) // 2
-        dialog.geometry(f"+{x}+{y}")
+        x = self.root.winfo_x() + (self.root.winfo_width() - 560) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 460) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         dialog.deiconify()
         dialog.grab_set()
         dialog.lift()
@@ -1957,7 +2020,7 @@ class SimpleUpdaterApp:
         content.pack(fill=tk.BOTH, expand=True)
 
         # 头像（大）
-        avatar_path = str(self.config_dir / "avatar.png")
+        avatar_path = str(self.resource_dir / "avatar.png")
         big_avatar = make_circle_avatar(avatar_path, size=96, glow_color=AETheme.NEON_CYAN)
         self._about_avatar = big_avatar  # 防止GC
 

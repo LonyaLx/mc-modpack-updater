@@ -28,6 +28,9 @@ _MRPACK_META_CACHE: Dict[tuple, dict] = {}
 # 本程序创建的所有临时目录（退出时统一清理）
 _TEMP_DIRS: List[Path] = []
 
+# 临时目录的“容器”目录（如 D:\.mc_updater_tmp），退出时若为空一并删除
+_TEMP_PARENTS: set = set()
+
 # Modrinth 整合包清单文件名
 MRPACK_MANIFEST_NAME = "modrinth.index.json"
 
@@ -50,6 +53,14 @@ def cleanup_zip_cache():
         except OSError:
             pass
     _TEMP_DIRS.clear()
+    # 顺带清掉空的容器目录（D:\.mc_updater_tmp 之类）
+    for parent in list(_TEMP_PARENTS):
+        try:
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+    _TEMP_PARENTS.clear()
     _ZIP_EXTRACT_CACHE.clear()
     _MRPACK_META_CACHE.clear()
 
@@ -62,9 +73,38 @@ def _cache_key(zip_path: Path) -> tuple:
         return (str(zip_path), 0, 0)
 
 
-def _new_temp_dir(prefix: str) -> Path:
-    """创建并登记一个临时目录"""
-    path = Path(tempfile.mkdtemp(prefix=prefix))
+def _new_temp_dir(prefix: str, base: Optional[Path] = None) -> Path:
+    """
+    创建并登记一个临时目录。
+    base 给定时，优先创建在 base 所在盘符的「.updater/_tmp」下，
+    避免大整合包解压/下载把系统盘（通常是 C:）撑爆；
+    base 不存在时退到该盘根目录的 .mc_updater_tmp；再失败则用系统临时目录。
+    """
+    root: Optional[Path] = None
+    if base is not None:
+        try:
+            b = Path(base)
+            if b.is_file():
+                b = b.parent
+            if b.exists():
+                # 放在更新器自己的数据目录里：同盘、且已被扫描忽略
+                cand = b / ".updater" / "_tmp"
+                cand.mkdir(parents=True, exist_ok=True)
+                _TEMP_PARENTS.add(cand)
+                root = cand
+            else:
+                anchor = b.anchor or ""
+                if anchor:
+                    cand = Path(anchor) / ".mc_updater_tmp"
+                    cand.mkdir(parents=True, exist_ok=True)
+                    _TEMP_PARENTS.add(cand)
+                    root = cand
+        except OSError:
+            root = None
+    try:
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root) if root else None))
+    except OSError:
+        path = Path(tempfile.mkdtemp(prefix=prefix))
     _TEMP_DIRS.append(path)
     return path
 
@@ -368,10 +408,12 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
 
 
 def _assemble_mrpack(raw_root: Path, index_file: Path,
-                     log_callback=None, progress_callback=None) -> Tuple[Path, Dict]:
+                     log_callback=None, progress_callback=None,
+                     base_hint: Optional[Path] = None) -> Tuple[Path, Dict]:
     """
     把 Modrinth 整合包组装成一个完整的整合包根目录：
-      overrides/ 内容 + 清单里声明的全部资源（联网下载）
+      overrides/ + client-overrides/ 内容 + 清单里声明的全部资源（联网下载）
+    :param base_hint: 整合包所在目录，用于把临时文件放到同一个盘符（省系统盘空间）
     :return: (整合包根目录, 清单元信息)
     """
     log = log_callback or (lambda *a: None)
@@ -395,19 +437,40 @@ def _assemble_mrpack(raw_root: Path, index_file: Path,
     log(f"检测到 Modrinth 整合包：{pack_name} {pack_ver}"
         f"（MC {game_ver} {loader_text}）", "info")
 
-    merged = _new_temp_dir("mc_mrpack_")
+    merged = _new_temp_dir("mc_mrpack_", base=base_hint)
 
-    # 1) overrides 里的内容（config / kubejs / 本地自有 mod 等）
-    overrides = raw_root / "overrides"
-    if overrides.is_dir():
+    # 1) overrides 内容（config / kubejs / 本地自有 mod 等）
+    #    client-overrides 按 Modrinth 规范是"仅客户端"覆盖层，后应用、优先级更高
+    for folder, label in (("overrides", "overrides"), ("client-overrides", "client-overrides")):
+        src_dir = raw_root / folder
+        if not src_dir.is_dir():
+            continue
         moved = 0
-        for item in overrides.iterdir():
+        for item in src_dir.iterdir():
+            dst = merged / item.name
             try:
-                shutil.move(str(item), str(merged / item.name))
+                if dst.exists():
+                    # 同名（一般是目录）：合并进去，保证后者的文件覆盖前者
+                    if item.is_dir() and dst.is_dir():
+                        for sub in item.rglob("*"):
+                            target = dst / sub.relative_to(item)
+                            if sub.is_dir():
+                                target.mkdir(parents=True, exist_ok=True)
+                            else:
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(sub, target)
+                    else:
+                        if dst.is_dir():
+                            shutil.rmtree(dst, ignore_errors=True)
+                        elif dst.is_file():
+                            dst.unlink()
+                        shutil.move(str(item), str(dst))
+                else:
+                    shutil.move(str(item), str(dst))
                 moved += 1
             except (OSError, shutil.Error) as e:
-                log(f"合并 overrides 失败 {item.name}: {e}", "warning")
-        log(f"已合并 overrides 内容：{moved} 项", "info")
+                log(f"合并 {label} 失败 {item.name}: {e}", "warning")
+        log(f"已合并 {label} 内容：{moved} 项", "info")
 
     # 2) 清单声明的资源（需要联网下载）
     files = data.get("files") or []
@@ -449,13 +512,15 @@ def _assemble_mrpack(raw_root: Path, index_file: Path,
 
 
 def _prepare_new_pack(archive: Path, log_callback=None,
-                      progress_callback=None) -> Tuple[Path, Optional[Dict]]:
+                      progress_callback=None,
+                      base_hint: Optional[Path] = None) -> Tuple[Path, Optional[Dict]]:
     """
     把“新版本压缩包”处理成可直接对比的整合包根目录：
       - 普通 zip：解压后交给 _resolve_pack_root 继续识别（含套壳 / overrides）
       - Modrinth 整合包（.mrpack 或含 modrinth.index.json 的 zip）：
         自动下载清单里声明的全部模组，再与 overrides 合并
     同一个压缩包只处理一次。
+    :param base_hint: 整合包所在目录，临时文件优先放到同一盘符
     :return: (整合包根目录, Modrinth 元信息或 None)
     """
     log = log_callback or (lambda *a: None)
@@ -466,7 +531,7 @@ def _prepare_new_pack(archive: Path, log_callback=None,
     if cached and cached.exists():
         return cached, _MRPACK_META_CACHE.get(key)
 
-    temp_root = _new_temp_dir("mc_pack_")
+    temp_root = _new_temp_dir("mc_pack_", base=base_hint)
     total = 0
     log(f"正在解压新版本压缩包：{archive.name}", "info")
     try:
@@ -490,7 +555,8 @@ def _prepare_new_pack(archive: Path, log_callback=None,
     index_file = _find_mrpack_index(temp_root)
     if index_file is not None:
         index_dir = index_file.parent
-        final_root, meta = _assemble_mrpack(index_dir, index_file, log, progress)
+        final_root, meta = _assemble_mrpack(index_dir, index_file, log, progress,
+                                            base_hint=base_hint)
         _MRPACK_META_CACHE[key] = meta
         # 原始解压目录已经没用了（overrides 已移走）
         try:
@@ -515,6 +581,9 @@ def _extract_zip_to_temp(zip_path: Path, log_callback=None, progress_callback=No
 
 class SimpleUpdater:
     """简化版整合包更新器"""
+
+    # 备份保留份数：更新成功后只保留最近 N 份，避免备份无限堆积占满磁盘
+    BACKUP_KEEP = 3
 
     # 硬保留：用户数据，永远保留，不参与更新/删除
     HARD_PRESERVE_PATTERNS = [
@@ -673,6 +742,16 @@ class SimpleUpdater:
         self.progress_callback = progress_callback or (lambda *a: None)
         self.log_callback = log_callback or (lambda *a: None)
 
+        # 最近一次 compare() 扫描出来的旧目录清单（供备份阶段复用，避免重复全盘哈希）
+        self._last_old_scan: Optional[Dict[str, dict]] = None
+
+        # 先定位旧整合包根目录：新版本压缩包解压/下载的临时目录会放到同一个盘符，
+        # 避免大整合包把系统盘（通常是 C:）撑爆
+        self.old_dir, self._old_root_note = self._resolve_pack_root(Path(old_dir).resolve())
+
+        # 清掉上次异常退出（崩溃 / 强杀）残留的临时文件，避免一直占着磁盘
+        self._clear_stale_temp()
+
         # 新版本支持直接选择压缩包：
         #   - .zip    普通整合包，自动解压
         #   - .mrpack Modrinth 整合包，自动下载清单里声明的模组
@@ -680,11 +759,11 @@ class SimpleUpdater:
         new_path = Path(new_dir).resolve()
         if new_path.is_file() and new_path.suffix.lower() in ARCHIVE_SUFFIXES:
             new_path, self.mrpack_meta = _prepare_new_pack(
-                new_path, self.log_callback, self.progress_callback
+                new_path, self.log_callback, self.progress_callback,
+                base_hint=self.old_dir
             )
 
         # 自动识别整合包真实根目录（CurseForge overrides 外壳 / 启动器版本隔离）
-        self.old_dir, self._old_root_note = self._resolve_pack_root(Path(old_dir).resolve())
         self.new_dir, self._new_root_note = self._resolve_pack_root(new_path)
 
         self.preserve_config = preserve_config
@@ -710,6 +789,37 @@ class SimpleUpdater:
             self._log(f"旧整合包：{self._old_root_note}", "info")
         if self._new_root_note:
             self._log(f"新整合包：{self._new_root_note}", "info")
+
+    def _clear_stale_temp(self):
+        """
+        清掉上次异常退出残留的临时目录（整合包目录下的 .updater/_tmp）。
+        正常关闭程序时会删除，但崩溃 / 强制结束进程时可能留下来占空间。
+
+        注意：只删「本进程没有在用」的目录。同一个进程里可能同时存在多个
+        更新器实例（比如检测用的实例 + 回退对话框的实例），不能误删别人正在用的。
+        """
+        stale = self.old_dir / ".updater" / "_tmp"
+        try:
+            if not stale.is_dir():
+                return
+            in_use = set()
+            for p in list(_TEMP_DIRS):
+                try:
+                    in_use.add(p.resolve())
+                except OSError:
+                    continue
+            for child in stale.iterdir():
+                try:
+                    if child.resolve() in in_use:
+                        continue
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink()
+                except OSError:
+                    continue
+        except OSError:
+            pass
 
     def _ensure_dirs(self):
         """确保必要目录存在"""
@@ -766,12 +876,17 @@ class SimpleUpdater:
                     return True
         return False
 
-    def scan_directory(self, directory: Path) -> Dict[str, dict]:
-        """扫描目录，返回文件清单 {相对路径: {sha256, size}}"""
+    def scan_directory(self, directory: Path, label: str = "") -> Dict[str, dict]:
+        """
+        扫描目录，返回文件清单 {相对路径: {sha256, size}}
+        :param label: 非空时会把校验进度回调出去（大整合包不至于像卡死）
+        """
         result = {}
         if not directory.exists():
             return result
 
+        # 先收集要处理的文件列表（顺便知道总数，用于显示进度）
+        targets: List[Tuple[str, Path]] = []
         for root, dirs, files in os.walk(directory):
             root_path = Path(root)
             rel_root = root_path.relative_to(directory)
@@ -788,16 +903,26 @@ class SimpleUpdater:
                 rel_path = (rel_root_str + "/" + file).lstrip("/")
                 if self._should_ignore(rel_path):
                     continue
-                file_path = root_path / file
-                try:
-                    file_hash = self.file_sha256(file_path)
-                    file_size = file_path.stat().st_size
-                    result[rel_path] = {
-                        "sha256": file_hash,
-                        "size": file_size
-                    }
-                except IOError as e:
-                    self._log(f"读取文件失败 {rel_path}: {e}", "warning")
+                targets.append((rel_path, root_path / file))
+
+        total = len(targets)
+        if label:
+            self._log(f"正在校验{label}：共 {total} 个文件", "info")
+
+        for index, (rel_path, file_path) in enumerate(targets, 1):
+            try:
+                file_hash = self.file_sha256(file_path)
+                file_size = file_path.stat().st_size
+                result[rel_path] = {
+                    "sha256": file_hash,
+                    "size": file_size
+                }
+            except IOError as e:
+                self._log(f"读取文件失败 {rel_path}: {e}", "warning")
+
+            # 大整合包：每隔一定数量回报一次进度，避免界面看起来卡死
+            if label and total > 50 and (index % 50 == 0 or index == total):
+                self._progress(index, total, f"校验{label} {index}/{total}")
 
         return result
 
@@ -821,8 +946,11 @@ class SimpleUpdater:
         with open(self.manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-    def get_user_modified_files(self) -> List[str]:
-        """获取用户修改过的文件列表（对比当前文件和基准清单）"""
+    def get_user_modified_files(self, scanned: Optional[Dict[str, dict]] = None) -> List[str]:
+        """
+        获取用户修改过的文件列表（对比当前文件和基准清单）
+        :param scanned: 已经扫描好的旧目录清单（复用可省一次全盘哈希，大整合包很关键）
+        """
         manifest = self.load_manifest()
         if not manifest:
             # 没有基准清单，认为所有保留模式的文件都是用户修改的
@@ -845,7 +973,8 @@ class SimpleUpdater:
                 modified.append(rel_path)
 
         # 还有基准清单中没有但存在的保留文件（用户自己加的）
-        for rel_path in self.scan_directory(self.old_dir).keys():
+        current = scanned if scanned is not None else self.scan_directory(self.old_dir)
+        for rel_path in current.keys():
             if self._match_preserve(rel_path) and rel_path not in baseline:
                 modified.append(rel_path)
 
@@ -1240,11 +1369,11 @@ class SimpleUpdater:
         :return: {added, modified, removed, preserve_count, total_size, old_count, new_count}
         """
         self._log("扫描旧整合包文件...", "info")
-        old_files = self.scan_directory(self.old_dir)
+        old_files = self.scan_directory(self.old_dir, label="旧整合包")
         self._log(f"旧整合包: {len(old_files)} 个文件", "info")
 
         self._log("扫描新整合包文件...", "info")
-        new_files = self.scan_directory(self.new_dir)
+        new_files = self.scan_directory(self.new_dir, label="新整合包")
         self._log(f"新整合包: {len(new_files)} 个文件", "info")
 
         added = []
@@ -1425,6 +1554,9 @@ class SimpleUpdater:
             fabric_info = {"status": "error", "message": f"版本检测失败: {e}", "demanding_mods": []}
             pass
 
+        # 缓存旧目录扫描结果，更新时备份用户配置可以直接复用，省一次全盘哈希
+        self._last_old_scan = old_files
+
         return {
             "added": added,
             "modified": modified,
@@ -1454,16 +1586,39 @@ class SimpleUpdater:
         - 新增文件列表（回退时删除）
         :return: 备份目录名（时间戳）
         """
+        added_files = changes.get("added", [])
+        modified_files = changes.get("modified", [])
+        removed_files = changes.get("removed", [])
+        preserve_modified = set(changes.get("preserve_modified", []))
+
+        # 磁盘空间预检查：备份大约要占用「被修改 + 被删除」文件的体积，
+        # 空间不足时提前报错，避免备份写一半就失败（那时用户会处于半备份状态）
+        need_bytes = 0
+        for rel_path in list(modified_files) + list(removed_files):
+            try:
+                f = self.old_dir / rel_path
+                if f.is_file():
+                    need_bytes += f.stat().st_size
+            except OSError:
+                continue
+        if need_bytes > 0:
+            try:
+                free = shutil.disk_usage(str(self.updater_dir)).free
+            except OSError:
+                free = None
+            if free is not None and free < need_bytes * 1.15:
+                raise ValueError(
+                    f"磁盘空间不足，无法完成更新前的安全备份。\n"
+                    f"本次备份约需 {format_size(int(need_bytes * 1.15))}，"
+                    f"当前可用 {format_size(free)}。\n"
+                    f"请清理磁盘（或删除 .updater/backup 里的旧备份）后重试。"
+                )
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         backup_path = self.backup_dir / timestamp
         backup_path.mkdir(parents=True, exist_ok=True)
 
         self._log(f"创建备份: {timestamp}", "info")
-
-        added_files = changes.get("added", [])
-        modified_files = changes.get("modified", [])
-        removed_files = changes.get("removed", [])
-        preserve_modified = set(changes.get("preserve_modified", []))
 
         backup_manifest = {
             "backup_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1477,6 +1632,16 @@ class SimpleUpdater:
         removed_count = 0
         user_count = 0
 
+        # 备份进度（大整合包备份几个 GB 时，界面不至于像卡死）
+        backup_total = len(modified_files) + len(removed_files)
+        backup_done = 0
+
+        def _tick(msg: str):
+            nonlocal backup_done
+            backup_done += 1
+            if backup_total > 20 and (backup_done % 20 == 0 or backup_done == backup_total):
+                self._progress(backup_done, backup_total, msg)
+
         # 1. 备份被修改的文件（旧版本，从旧目录复制）
         for rel_path in modified_files:
             # 保留文件如果被用户修改过，单独备份到 user_files
@@ -1488,8 +1653,9 @@ class SimpleUpdater:
                     try:
                         shutil.copy2(src, dst)
                         user_count += 1
-                    except IOError as e:
+                    except (IOError, OSError) as e:
                         self._log(f"备份用户配置失败 {rel_path}: {e}", "warning")
+                _tick(f"备份用户配置：{rel_path}")
                 continue
 
             # 普通修改的文件，备份旧版本
@@ -1500,8 +1666,9 @@ class SimpleUpdater:
                 try:
                     shutil.copy2(src, dst)
                     modified_count += 1
-                except IOError as e:
+                except (IOError, OSError) as e:
                     self._log(f"备份修改文件失败 {rel_path}: {e}", "warning")
+            _tick(f"备份修改文件：{rel_path}")
 
         # 2. 备份被删除的文件（保留文件除外）
         for rel_path in removed_files:
@@ -1514,8 +1681,9 @@ class SimpleUpdater:
                     try:
                         shutil.copy2(src, dst)
                         user_count += 1
-                    except IOError as e:
+                    except (IOError, OSError) as e:
                         self._log(f"备份用户配置失败 {rel_path}: {e}", "warning")
+                _tick(f"备份用户配置：{rel_path}")
                 continue
 
             src = self.old_dir / rel_path
@@ -1525,12 +1693,13 @@ class SimpleUpdater:
                 try:
                     shutil.copy2(src, dst)
                     removed_count += 1
-                except IOError as e:
+                except (IOError, OSError) as e:
                     self._log(f"备份删除文件失败 {rel_path}: {e}", "warning")
+            _tick(f"备份删除文件：{rel_path}")
 
         # 3. 还要备份用户修改过、但本次更新没涉及到的保留文件
         # （保证回退后用户配置完整）
-        all_user_modified = self.get_user_modified_files()
+        all_user_modified = self.get_user_modified_files(scanned=self._last_old_scan)
         for rel_path in all_user_modified:
             if rel_path in preserve_modified:
                 continue  # 已经备份过了
@@ -1543,7 +1712,7 @@ class SimpleUpdater:
                 try:
                     shutil.copy2(src, dst)
                     user_count += 1
-                except IOError as e:
+                except (IOError, OSError) as e:
                     self._log(f"备份用户配置失败 {rel_path}: {e}", "warning")
 
         backup_manifest["modified_count"] = modified_count
@@ -1589,6 +1758,50 @@ class SimpleUpdater:
         backups.sort(key=lambda x: x["name"], reverse=True)
         return backups
 
+    def backup_total_size(self) -> int:
+        """所有备份占用的磁盘空间（字节）"""
+        if not self.backup_dir.exists():
+            return 0
+        total = 0
+        for root, _dirs, files in os.walk(self.backup_dir):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    continue
+        return total
+
+    def keep_backups(self, keep: int = None) -> List[str]:
+        """
+        只保留最近 keep 份备份，其余删除（按目录名从新到旧排序）。
+        备份体积很大，长期不清理会把磁盘占满。
+        :return: 被删除的备份目录名列表
+        """
+        keep = self.BACKUP_KEEP if keep is None else keep
+        backups = self.get_backup_list()  # 已按新→旧排序
+        removed = []
+        for item in backups[max(keep, 0):]:
+            name = item["name"]
+            try:
+                shutil.rmtree(self.backup_dir / name, ignore_errors=True)
+                removed.append(name)
+            except OSError:
+                continue
+
+        # 顺手清掉没有清单的残缺备份目录（上次备份中断留下的）
+        try:
+            for child in self.backup_dir.iterdir():
+                if not child.is_dir():
+                    continue
+                if not (child / "backup_manifest.json").exists():
+                    shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            pass
+
+        if removed:
+            self._log(f"已清理 {len(removed)} 份旧备份（只保留最近 {keep} 份）", "info")
+        return removed
+
     def do_update(self, changes: Optional[Dict] = None) -> Tuple[bool, str, str]:
         """
         执行更新
@@ -1603,20 +1816,44 @@ class SimpleUpdater:
         if changes is None:
             changes = self.compare()
 
-        # 备份
-        backup_name = self._backup_before_update(changes)
-
         added = changes.get("added", [])
         modified = changes.get("modified", [])
         removed = changes.get("removed", []) if self.delete_removed else []
         preserve_modified = set(changes.get("preserve_modified", []))
 
+        # 没有差异就不必备份（否则会留下一堆空备份）
+        if len(added) + len(modified) + len(removed) == 0:
+            self._log("没有需要更新的文件", "info")
+            return True, "已经是最新状态，无需更新", ""
+
+        # 更新前空间预检：新增 + 修改的文件还要复制进旧整合包，
+        # 空间不够就提前报错，免得写到一半失败留下「半更新」状态
+        copy_bytes = 0
+        for rel_path in added + modified:
+            try:
+                f = self.new_dir / rel_path
+                if f.is_file():
+                    copy_bytes += f.stat().st_size
+            except OSError:
+                continue
+        if copy_bytes > 0:
+            try:
+                free = shutil.disk_usage(str(self.old_dir)).free
+            except OSError:
+                free = None
+            if free is not None and free < copy_bytes * 1.1:
+                raise ValueError(
+                    f"磁盘空间不足，无法完成更新。\n"
+                    f"本次需要写入约 {format_size(int(copy_bytes * 1.1))}，"
+                    f"当前可用 {format_size(free)}。\n"
+                    f"请清理磁盘后重试（也可以先删掉 .updater/backup 里的旧备份）。"
+                )
+
+        # 备份
+        backup_name = self._backup_before_update(changes)
+
         total_ops = len(added) + len(modified) + len(removed)
         processed = 0
-
-        if total_ops == 0:
-            self._log("没有需要更新的文件", "info")
-            return True, "已经是最新状态，无需更新"
 
         self._log(f"开始更新: 新增 {len(added)}，修改 {len(modified)}，删除 {len(removed)}", "info")
 
@@ -1636,9 +1873,15 @@ class SimpleUpdater:
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
-            except IOError as e:
+            except (IOError, OSError) as e:
                 self._log(f"复制失败 {rel_path}: {e}", "error")
-                return False, f"更新失败: {rel_path} - {e}"
+                return (
+                    False,
+                    f"更新失败: {rel_path}\n原因: {e}\n\n"
+                    f"已经更新过的文件可能处于「半更新」状态，"
+                    f"可以在「版本回退」里回退到 {backup_name} 恢复。",
+                    backup_name,
+                )
 
             self._progress(processed, total_ops, f"更新: {rel_path}")
 
@@ -1667,6 +1910,12 @@ class SimpleUpdater:
         # 4. 保存新的基准清单（新整合包的标准状态，用于下次对比判断用户修改）
         new_standard = self.scan_directory(self.new_dir)
         self.save_manifest(new_standard, version_label=backup_name)
+
+        # 5. 只保留最近几份备份，避免备份无限堆积占满磁盘
+        try:
+            self.keep_backups()
+        except OSError:
+            pass
 
         self._progress(total_ops, total_ops, "更新完成!")
         self._log(

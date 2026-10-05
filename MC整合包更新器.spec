@@ -10,7 +10,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # 这些库本程序用不到。Pillow 的可选加速会把 numpy 一起带进来，
+        # 白白让 EXE 大十几 MB、启动也更慢，这里显式排除。
+        'numpy',
+        'scipy',
+        'pandas',
+        'matplotlib',
+        'pyreadline3',
+        'IPython',
+        'jupyter',
+    ],
     noarchive=False,
     optimize=0,
 )
