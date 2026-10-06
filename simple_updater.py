@@ -5,6 +5,7 @@ Minecraft 整合包更新器 - 简化版核心引擎
 """
 
 import os
+import sys
 import json
 import hashlib
 import shutil
@@ -263,6 +264,50 @@ def _http_download(url: str, dest: Path, expected_sha1: str = "", timeout: int =
     return total
 
 
+def _fix_zip_name(name: str, flag_bits: int = 0) -> str:
+    """
+    还原 zip 条目里的文件名。
+    中文压缩包（WinRAR / 好压 等在中文系统下打包）常常用 GBK 存文件名却没置
+    UTF-8 标志，zipfile 会按 cp437 解成乱码（如 ╠∞╣ñ），导致新旧包路径对不上。
+    这里尝试用常见东亚编码还原。
+    """
+    if flag_bits & 0x800:      # 压缩包已经明确用 UTF-8，直接信它
+        return name
+    try:
+        raw = name.encode("cp437")
+    except UnicodeEncodeError:
+        return name
+    # 非 ASCII 字符太少就不折腾，免得把正常的西欧字符（如 Pokémon）弄坏
+    if sum(1 for ch in name if ord(ch) > 127) < 2:
+        return name
+    for enc in ("gbk", "big5", "shift_jis", "cp949"):
+        try:
+            cand = raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if any("\u4e00" <= ch <= "\u9fff" for ch in cand):
+            return cand
+    return name
+
+
+def _safe_rel_name(name: str) -> Optional[str]:
+    """
+    规范化相对路径；非法路径（绝对路径、含 ..、带盘符）返回 None。
+    用于压缩包条目和 Modrinth 清单，防止路径穿越写出目录外。
+    """
+    name = str(name or "").replace("\\", "/").strip()
+    while name.startswith("./"):
+        name = name[2:]
+    if not name or name.startswith("/"):
+        return None
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    if len(parts[0]) == 2 and parts[0][1] == ":":    # C:/xxx 这种带盘符的
+        return None
+    return "/".join(parts)
+
+
 def _find_mrpack_index(root: Path) -> Optional[Path]:
     """在解压根目录（或下一层）寻找 modrinth.index.json"""
     direct = root / MRPACK_MANIFEST_NAME
@@ -291,15 +336,23 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
 
     todo: List[dict] = []
     skipped: List[str] = []
+    bad_paths = 0
     for item in files or []:
-        rel = str(item.get("path") or "").replace("\\", "/")
+        rel = _safe_rel_name(item.get("path"))
+        if rel is None:
+            # 清单里出现绝对路径 / .. 之类，直接忽略（防止写到整合包外面）
+            bad_paths += 1
+            continue
         env = item.get("env") or {}
         if str(env.get("client", "")).lower() == "unsupported":
             skipped.append(rel)
             continue
-        if not rel:
-            continue
+        item = dict(item)
+        item["path"] = rel
         todo.append(item)
+
+    if bad_paths:
+        log(f"清单里有 {bad_paths} 条非法路径（绝对路径或含 ..），已忽略", "warning")
 
     total = len(todo)
     if total == 0:
@@ -321,6 +374,9 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
         rel = str(item.get("path") or "").replace("\\", "/")
         dest = target_root / rel
         sha1 = str((item.get("hashes") or {}).get("sha1") or "").lower()
+        # 哈希必须是干净的 40 位十六进制，否则不能拿它当缓存文件名（防路径穿越）
+        if len(sha1) != 40 or any(c not in "0123456789abcdef" for c in sha1):
+            sha1 = ""
         size = int(item.get("fileSize") or 0)
 
         # 1) 目标已存在且校验通过 → 跳过
@@ -538,14 +594,38 @@ def _prepare_new_pack(archive: Path, log_callback=None,
         with zipfile.ZipFile(archive) as zf:
             members = zf.infolist()
             total = len(members)
+            fixed_names = 0
+            skipped = 0
             for i, member in enumerate(members, 1):
-                # 防止压缩包内的路径穿越
-                name = member.filename.replace("\\", "/")
-                if name.startswith("/") or ".." in name.split("/"):
+                raw = str(member.filename).replace("\\", "/")
+                name = _fix_zip_name(raw, member.flag_bits)
+                if name != raw:
+                    fixed_names += 1
+                # 防止压缩包内的路径穿越 / 非法路径
+                rel = _safe_rel_name(name)
+                if rel is None:
+                    skipped += 1
                     continue
-                zf.extract(member, temp_root)
+
+                dest = temp_root / rel
+                try:
+                    if member.is_dir() or name.endswith("/"):
+                        dest.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member) as src_f, open(dest, "wb") as out_f:
+                            shutil.copyfileobj(src_f, out_f)
+                except (OSError, zipfile.BadZipFile, RuntimeError) as e:
+                    skipped += 1
+                    log(f"解压跳过 {rel}：{e}", "warning")
+
                 if total <= 20 or i % 20 == 0 or i == total:
-                    progress(i, total, f"解压：{name}")
+                    progress(i, total, f"解压：{rel}")
+
+            if fixed_names:
+                log(f"已修正 {fixed_names} 个中文文件名（压缩包用的是 GBK 编码）", "info")
+            if skipped:
+                log(f"有 {skipped} 个条目被跳过（路径非法或无法写入）", "warning")
     except (zipfile.BadZipFile, OSError) as e:
         shutil.rmtree(temp_root, ignore_errors=True)
         log(f"解压失败：{e}", "error")
@@ -585,23 +665,45 @@ class SimpleUpdater:
     # 备份保留份数：更新成功后只保留最近 N 份，避免备份无限堆积占满磁盘
     BACKUP_KEEP = 3
 
-    # 硬保留：用户数据，永远保留，不参与更新/删除
+    # 硬保留：用户自己放的东西
+    # 语义：已有的不修改、不删除；但允许整合包「新增」自己的资源包 / 光影
     HARD_PRESERVE_PATTERNS = [
-        "saves/",            # 存档（绝对不能动）
-        "servers.dat",       # 服务器列表
-        "resourcepacks/",    # 资源包
-        "shaderpacks/",      # 光影包
-        "schematics/",       # 原理图
+        "resourcepacks/",          # 资源包（用户自己加的不能被删）
+        "shaderpacks/",            # 光影包
+        "schematics/",             # 原理图
+        "mods/*.disabled",         # 被禁用的模组
+        "resourcepacks/*.disabled",
+        "shaderpacks/*.disabled",
+    ]
+
+    # 用户数据：完全不动
+    # 语义：不新增、不修改、不删除。连「新整合包自带的」也不写进去，避免污染玩家数据
+    USER_DATA_PATTERNS = [
+        "saves/",             # 存档（绝对不能动）
+        "screenshots/",       # 截图
         "replay_recordings/", # 回放录像
-        "screenshots/",      # 截图
-        "mods/*.disabled",   # 被禁用的模组
+        "backups/",           # 世界备份（FTB 等模组生成）
+        "journeymap/",        # 小地图数据
+        "xaero/",             # Xaero 小地图 / 世界地图数据
+        "servers.dat",        # 服务器列表
+        # 服务端整合包：世界和服主配置同样不能动
+        "world/",
+        "world_nether/",
+        "world_the_end/",
+        "server.properties",
+        "whitelist.json",
+        "ops.json",
+        "banned-players.json",
+        "banned-ips.json",
+        "eula.txt",
     ]
 
     # 可选保留：配置文件，用户可选择是否保留
     # 默认不保留（跟随整合包更新）
     CONFIG_PRESERVE_PATTERNS = [
-        "config/",           # 模组配置
-        "options.txt",       # 游戏选项（键位等）
+        "config/",            # 模组配置
+        "options.txt",        # 游戏选项（键位等）
+        "optionsof.txt",      # OptiFine 设置
         "optionsshaders.txt", # 光影设置
     ]
 
@@ -620,9 +722,24 @@ class SimpleUpdater:
         "*.log.gz",
         "*.tmp",
         "*.part",            # 下载中断残留的临时文件
+        # 压缩包里的系统垃圾（macOS / Windows / 版本控制）
+        "__MACOSX/",
+        ".git/",
+        ".svn/",
+        ".idea/",
+        ".vscode/",
         ".DS_Store",
+        "._*",
         "Thumbs.db",
         "desktop.ini",
+        # 启动器自己的文件（跟整合包内容无关）
+        "usercache.json",
+        "launcher_profiles.json",
+        "launcher_accounts.json",
+        "realms_persistence.json",
+        "servers.dat_old",
+        "debug/",
+        "hs_err_pid*",
         # 整合包包装文件（CurseForge / 启动器导出，只在根目录层级生效）
         "manifest.json",
         "modlist.html",
@@ -637,6 +754,18 @@ class SimpleUpdater:
     # 判断“这是一个整合包目录”的标志性内容目录
     PACK_CONTENT_DIRS = ["mods", "kubejs", "config", "defaultconfigs"]
 
+    # 只有这些目录才算“整合包真的在这里”（config/ 单独出现不算，可能只是 .minecraft）
+    STRONG_PACK_DIRS = ["mods", "kubejs"]
+
+    # 解压后常见的无关目录 / 文件（不影响“是否该往下钻”的判断）
+    JUNK_DIR_NAMES = {
+        "__MACOSX", ".git", ".svn", ".idea", ".vscode", ".hg",
+        "System Volume Information", "$RECYCLE.BIN", "lost+found",
+    }
+    JUNK_FILE_NAMES = {
+        ".DS_Store", "Thumbs.db", "desktop.ini", ".localized", "Icon\r",
+    }
+
     # 整合包“包装文件”特征（出现这些说明外面还套了一层壳）
     PACK_WRAPPER_MARKERS = [
         "manifest.json",
@@ -646,38 +775,150 @@ class SimpleUpdater:
     ]
 
     @classmethod
+    def _is_junk_dir(cls, path: Path) -> bool:
+        name = path.name
+        return name in cls.JUNK_DIR_NAMES or name.startswith("._")
+
+    @classmethod
+    def _is_junk_file(cls, path: Path) -> bool:
+        name = path.name
+        return name in cls.JUNK_FILE_NAMES or name.startswith("._")
+
+    @classmethod
+    def _has_mods(cls, directory: Path) -> bool:
+        """目录里有没有 mods/ 或 kubejs/（这两个只有真整合包根目录才有）"""
+        try:
+            return any((directory / d).is_dir() for d in cls.STRONG_PACK_DIRS)
+        except OSError:
+            return False
+
+    @classmethod
+    def _has_pack_content(cls, directory: Path) -> bool:
+        try:
+            return any((directory / d).is_dir() for d in cls.PACK_CONTENT_DIRS)
+        except OSError:
+            return False
+
+    @classmethod
+    def _has_real_mods(cls, directory: Path) -> bool:
+        """
+        mods/ 或 kubejs/ 存在且里面有东西。
+        空的 mods/ 目录不算（PCL 等启动器切换版本隔离后会留下空目录，
+        误当成整合包根目录会让用户选错层级）。
+        """
+        for name in cls.STRONG_PACK_DIRS:
+            p = directory / name
+            try:
+                if p.is_dir() and any(p.iterdir()):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    @classmethod
+    def _looks_like_minecraft_root(cls, directory: Path) -> bool:
+        """像不像启动器的 .minecraft 根目录（而不是某个整合包目录）"""
+        for name in ("libraries", "assets", "runtime"):
+            try:
+                if (directory / name).is_dir():
+                    return True
+            except OSError:
+                continue
+        return (directory / "launcher_profiles.json").is_file()
+
+    @classmethod
+    def _looks_like_pack_root(cls, directory: Path) -> bool:
+        """像不像一个整合包根目录（含启动器外壳的情况就算）"""
+        if cls._has_mods(directory) or cls._has_pack_content(directory):
+            return True
+        for sub in ("overrides", ".minecraft"):
+            d = directory / sub
+            if d.is_dir() and (cls._has_mods(d) or cls._has_pack_content(d)):
+                return True
+        return False
+
+    @classmethod
+    def _contains_pack(cls, directory: Path, depth: int = 3) -> bool:
+        """
+        该目录「自己」或往下几层里，是否有整合包（用来判断要不要继续往下钻）。
+        应对 one/MyPack/mods 这种多套一层的压缩包。
+        """
+        if cls._looks_like_pack_root(directory):
+            return True
+        if depth <= 0:
+            return False
+        try:
+            kids = [c for c in directory.iterdir() if c.is_dir() and not cls._is_junk_dir(c)]
+        except OSError:
+            return False
+        if len(kids) != 1:
+            return False
+        return cls._contains_pack(kids[0], depth - 1)
+
+    @classmethod
     def _resolve_pack_root(cls, directory: Path) -> Tuple[Path, str]:
         """
         自动定位整合包的真实根目录，避免因为目录结构不同而误删/误更新文件。
-        依次识别（可连续下钻）：
+        可连续下钻，依次识别：
           1. 目录本身就是整合包根目录（有 mods/ 或 kubejs/）
-          2. 选中的是 .minecraft 根目录（PCL/HMCL 版本隔离）→ versions/<实例>/
-          3. 解压出来的 CurseForge 整合包（带 overrides/ 外壳）→ overrides/
-          4. 解压后只有一层同名文件夹 → 自动进入
+          2. 启动器实例目录（PrismLauncher / MultiMC：实例里有 .minecraft/）→ .minecraft/
+          3. .minecraft 根目录（PCL / HMCL 版本隔离）→ versions/<实例>/
+          4. CurseForge overrides 外壳 → overrides/
+          5. 解压出来的单层包装目录（忽略 __MACOSX / README / 说明 之类的无关文件）
         返回 (真实根目录, 说明文字)
         """
         notes: List[str] = []
         current = directory
 
-        for _ in range(4):  # 最多下钻 4 层，避免死循环
+        for _ in range(6):  # 最多下钻 6 层，避免死循环
             try:
                 if not current.exists() or not current.is_dir():
                     break
             except OSError:
                 break
 
+            # 0) 这明显是启动器的 .minecraft 根目录（有 libraries/ assets/ 等）
+            #    且里面有版本隔离的实例 → 优先用实例，
+            #    避免被残留的空 .minecraft/mods 目录误导
+            if cls._looks_like_minecraft_root(current) and (current / "versions").is_dir():
+                try:
+                    real = [
+                        c for c in (current / "versions").iterdir()
+                        if c.is_dir() and cls._has_real_mods(c)
+                    ]
+                except OSError:
+                    real = []
+                if real:
+                    chosen = max(real, key=lambda p: p.stat().st_mtime)
+                    if len(real) > 1:
+                        notes.append(
+                            f"检测到多个整合包实例，已自动使用最近修改的：{chosen}"
+                            f"（如不对请手动选择实例文件夹）"
+                        )
+                    else:
+                        notes.append(f"检测到启动器实例目录，已自动使用：{chosen}")
+                    current = chosen
+                    continue
+
             # 1) 本身就是整合包根目录
-            if any((current / d).exists() for d in ("mods", "kubejs")):
+            if cls._has_mods(current):
                 break
 
-            # 2) .minecraft 根目录 → 版本隔离的实例目录
+            # 2) 启动器实例目录：实例文件夹里放着 .minecraft/
+            #    （PrismLauncher / MultiMC 的 instances/<名>/ 就是这个结构）
+            mc = current / ".minecraft"
+            if mc.is_dir() and cls._has_pack_content(mc):
+                notes.append(f"检测到启动器实例目录，已自动进入：{mc}")
+                current = mc
+                continue
+
+            # 3) .minecraft 根目录 → 版本隔离的实例目录
             versions = current / "versions"
             if versions.is_dir():
                 try:
                     candidates = [
                         child for child in versions.iterdir()
-                        if child.is_dir()
-                        and any((child / d).exists() for d in cls.PACK_CONTENT_DIRS)
+                        if child.is_dir() and cls._has_pack_content(child)
                     ]
                 except OSError:
                     candidates = []
@@ -692,32 +933,48 @@ class SimpleUpdater:
                         notes.append(f"检测到启动器实例目录，已自动使用：{chosen}")
                     current = chosen
                     continue
+                # 是 .minecraft 但没有找到带 mods 的实例，很可能选错了层级
+                if not cls._has_mods(current):
+                    notes.append(
+                        f"看起来是 .minecraft 目录，但里面没找到带 mods/ 的实例，"
+                        f"请确认选的是整合包实例文件夹"
+                    )
+                    break
 
-            # 3) CurseForge overrides 外壳
+            # 4) CurseForge overrides 外壳
             overrides = current / "overrides"
-            if overrides.is_dir() and any(
-                (overrides / d).exists() for d in cls.PACK_CONTENT_DIRS
-            ):
+            if overrides.is_dir() and cls._has_pack_content(overrides):
                 notes.append(f"检测到 CurseForge overrides 结构，已自动使用：{overrides}")
                 current = overrides
                 continue
 
-            # 4) 解压后的单层包装目录
+            # 5) 单层包装目录：忽略 __MACOSX / .git / README 这类无关内容
             try:
-                children = [c for c in current.iterdir() if c.is_dir()]
-                root_files = [f for f in current.iterdir() if f.is_file()]
+                kids = [c for c in current.iterdir() if c.is_dir() and not cls._is_junk_dir(c)]
             except OSError:
                 break
-            if len(children) == 1 and not root_files:
-                child = children[0]
-                if (child / "overrides").is_dir() or any(
-                    (child / d).exists() for d in cls.PACK_CONTENT_DIRS
-                ):
-                    notes.append(f"检测到单层包装目录，已自动进入：{child}")
-                    current = child
-                    continue
+            if len(kids) == 1 and (cls._looks_like_pack_root(kids[0])
+                                   or cls._contains_pack(kids[0])):
+                child = kids[0]
+                notes.append(f"检测到单层包装目录，已自动进入：{child.name}/")
+                current = child
+                continue
 
             break
+
+        # 兜底提示：下钻完还是找不到整合包特征，说明目录多半选错了
+        try:
+            if current.is_dir() and not cls._looks_like_pack_root(current):
+                if (current / "manifest.json").is_file():
+                    notes.append(
+                        "检测到 CurseForge 的 manifest.json，但压缩包里没有 mods/。"
+                        "这是「只含清单」的整合包，模组需要从 CurseForge 下载，"
+                        "本工具无法自动获取，请改用「包含 mods 的完整整合包」"
+                    )
+                else:
+                    notes.append("没找到 mods/ 或 config/，请确认选择的是整合包目录")
+        except OSError:
+            pass
 
         return current, "；".join(notes)
 
@@ -767,16 +1024,40 @@ class SimpleUpdater:
         self.new_dir, self._new_root_note = self._resolve_pack_root(new_path)
 
         self.preserve_config = preserve_config
-        self.ignore_patterns = list(set(self.DEFAULT_IGNORE_PATTERNS + (ignore_patterns or [])))
         self.delete_removed = delete_removed
 
-        # 组装完整保留列表：硬保留 + 可选配置保留 + 额外保留
-        all_preserve = list(self.HARD_PRESERVE_PATTERNS)
+        # 用户数据（存档 / 截图 / 小地图 / 服务端世界 等）直接排除在扫描之外：
+        # 既保证绝对不动，也避免把几十 GB 的存档全量哈希一遍（否则检测会非常慢）
+        self.ignore_patterns = list(set(
+            self.DEFAULT_IGNORE_PATTERNS + self.USER_DATA_PATTERNS + (ignore_patterns or [])
+        ))
+
+        # 如果更新器自己就被放在整合包目录里（有人直接把 EXE 丢进 .minecraft），
+        # 更新时千万别把它自己当旧文件删掉
+        try:
+            if getattr(sys, "frozen", False):
+                exe = Path(sys.executable).resolve()
+                if exe.is_file():
+                    self.ignore_patterns.append(str(exe.relative_to(self.old_dir)).replace("\\", "/"))
+        except (ValueError, OSError):
+            pass
+
+        # 组装完整保留列表：
+        #   硬保留（用户自己放的东西，不修改/不删除）
+        # + 用户数据（完全不动，连新增都不做）
+        # + 可选配置保留（用户勾选时）
+        # + 额外保留
+        all_preserve = list(self.HARD_PRESERVE_PATTERNS) + list(self.USER_DATA_PATTERNS)
         if preserve_config:
             all_preserve += self.CONFIG_PRESERVE_PATTERNS
         if extra_preserve_patterns:
             all_preserve += extra_preserve_patterns
         self.preserve_patterns = list(set(all_preserve))
+        self.user_data_patterns = list(set(self.USER_DATA_PATTERNS))
+        # 「已有的不动」：用户自己放的东西 + 用户数据，整合包带来的同名文件不会覆盖它们
+        self.keep_existing_patterns = list(set(
+            self.HARD_PRESERVE_PATTERNS + self.USER_DATA_PATTERNS
+        ))
 
         self.updater_dir = self.old_dir / ".updater"
         self.backup_dir = self.updater_dir / "backup"
@@ -860,21 +1141,38 @@ class SimpleUpdater:
                     return True
         return False
 
-    def _match_preserve(self, rel_path: str) -> bool:
-        """检查路径是否匹配保留模式"""
+    @staticmethod
+    def _match_patterns(rel_path: str, patterns) -> bool:
+        """按一组 glob 模式匹配相对路径"""
         import fnmatch
-        rel_path = rel_path.replace("\\", "/")
-        for pattern in self.preserve_patterns:
+        rel_path = str(rel_path).replace("\\", "/")
+        for pattern in patterns:
             if pattern.endswith("/"):
+                # 目录模式：匹配该目录及其中所有内容
                 if rel_path.startswith(pattern) or rel_path + "/" == pattern:
                     return True
             elif "*" in pattern:
-                if fnmatch.fnmatch(rel_path, pattern):
+                if fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(
+                    Path(rel_path).name, pattern
+                ):
                     return True
             else:
+                # 精确文件名：只在根目录层级生效，避免误伤同名资源
                 if rel_path == pattern:
                     return True
         return False
+
+    def _match_preserve(self, rel_path: str) -> bool:
+        """检查路径是否匹配保留模式（已有的不修改、不删除）"""
+        return self._match_patterns(rel_path, self.preserve_patterns)
+
+    def _match_user_data(self, rel_path: str) -> bool:
+        """检查路径是否属于用户数据（完全不动，连新增都不做）"""
+        return self._match_patterns(rel_path, self.user_data_patterns)
+
+    def _match_keep_existing(self, rel_path: str) -> bool:
+        """检查路径是否属于「用户自己放的东西」（已存在的不会被整合包覆盖）"""
+        return self._match_patterns(rel_path, self.keep_existing_patterns)
 
     def scan_directory(self, directory: Path, label: str = "") -> Dict[str, dict]:
         """
@@ -1381,7 +1679,13 @@ class SimpleUpdater:
         removed = []
         total_size = 0
 
+        # 用户数据（存档 / 截图 / 小地图数据 等）永远不碰：
+        # 连「新整合包自带」的也不写进去，免得污染玩家自己的数据
+        skipped_userdata = 0
         for path, info in new_files.items():
+            if self._match_user_data(path):
+                skipped_userdata += 1
+                continue
             if path not in old_files:
                 added.append(path)
                 total_size += info.get("size", 0)
@@ -1389,12 +1693,54 @@ class SimpleUpdater:
                 modified.append(path)
                 total_size += info.get("size", 0)
 
-        # 删除列表：排除保留文件
+        # 基准清单：记录「上一次更新后整合包的标准状态」
+        # 用它区分「整合包自带的旧文件」（该删）和「玩家自己手动加的」（不该删）
+        manifest = self.load_manifest()
+        baseline = (manifest or {}).get("files") or {}
+        has_baseline = bool(baseline)
+
+        # 删除列表：排除保留文件；有基准清单时还要排除玩家自己加的文件
+        user_added = []
         for path in old_files:
-            if path not in new_files and not self._match_preserve(path):
-                removed.append(path)
+            if path in new_files or self._match_preserve(path):
+                continue
+            if has_baseline and path not in baseline:
+                # 不在上次整合包标准状态里 → 是玩家自己加的，默认保留
+                user_added.append(path)
+                continue
+            removed.append(path)
+
+        if user_added:
+            self._log(
+                f"检测到 {len(user_added)} 个你自己添加/修改过的文件，"
+                f"本次不会删除它们（如需清理请手动处理）", "info"
+            )
+        elif not has_baseline and self.delete_removed and removed:
+            self._log(
+                "提示：这是第一次用本更新器更新这个整合包，还没有基准记录，"
+                "无法区分「整合包自带」和「你手动添加」的文件。"
+                "本次勾选了「删除新版本中没有的旧文件」，你手动添加的模组也会一并删除；"
+                "如果想保留，请先取消勾选该选项再更新。", "warning"
+            )
+        if skipped_userdata:
+            self._log(f"跳过 {skipped_userdata} 个用户数据文件（存档/截图等），不会写入", "info")
 
         # 统计被保留的文件数（旧包里匹配保留模式且在修改列表中的）
+        # 先区分两类：
+        #   ① keep_existing —— 用户自己放的东西（资源包 / 光影 / 存档…），
+        #      整合包带来的同名文件不覆盖它，所以根本不算「要更新的文件」
+        #   ② preserve_modified —— 勾选了「保留配置文件」时，用户改过的 config
+        kept_existing = [p for p in modified if self._match_keep_existing(p)]
+        if kept_existing:
+            kept_set = set(kept_existing)
+            modified = [p for p in modified if p not in kept_set]
+            total_size = sum(
+                (new_files[p].get("size", 0)) for p in added + modified
+            )
+            self._log(
+                f"保留了你自己的 {len(kept_existing)} 个文件（资源包 / 光影 / 存档等）", "info"
+            )
+
         preserve_modified = [
             p for p in modified
             if self._match_preserve(p)
@@ -1561,6 +1907,10 @@ class SimpleUpdater:
             "added": added,
             "modified": modified,
             "removed": removed,
+            "user_added": user_added,
+            "kept_existing": kept_existing,
+            "has_baseline": has_baseline,
+            "skipped_userdata": skipped_userdata,
             "risky_removed": risky_removed,
             "removed_mods": removed_mods,
             "added_mods": added_mods,
@@ -1574,6 +1924,8 @@ class SimpleUpdater:
             "neoforge": neoforge_info,
             "fabric": fabric_info,
             "mrpack": self.mrpack_meta,
+            "old_root_note": self._old_root_note,
+            "new_root_note": self._new_root_note,
         }
 
     def _backup_before_update(self, changes: Dict) -> str:
@@ -1802,6 +2154,75 @@ class SimpleUpdater:
             self._log(f"已清理 {len(removed)} 份旧备份（只保留最近 {keep} 份）", "info")
         return removed
 
+    def _remove_path(self, path: Path) -> bool:
+        """
+        删除文件或目录，失败时先去只读属性再试一次。
+        返回是否删除成功。
+        """
+        try:
+            if not path.exists() and not path.is_symlink():
+                return False
+        except OSError:
+            return False
+
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            return True
+        except OSError:
+            pass
+
+        # 只读文件 / 目录：去掉只读属性后重试
+        try:
+            if path.is_dir():
+                for root, dirs, files in os.walk(path):
+                    for name in list(files) + list(dirs):
+                        try:
+                            os.chmod(Path(root) / name, 0o700)
+                        except OSError:
+                            pass
+                shutil.rmtree(path, ignore_errors=True)
+                return not path.exists()
+            os.chmod(path, 0o700)
+            path.unlink()
+            return True
+        except OSError as e:
+            self._log(f"删除失败 {path}: {e}", "warning")
+            return False
+
+    def _ensure_parent_dir(self, target_dir: Path):
+        """
+        确保 target_dir 是一条可用的目录链。
+        新旧整合包结构不一样时，链路上某一级可能被同名「文件」占着
+        （比如旧包是 config/xxx 文件，新包是 config/xxx/ 目录），
+        这里先把挡路的文件删掉（它已经在备份里了），再建目录。
+        """
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            return
+        except OSError:
+            pass
+
+        try:
+            rel = target_dir.relative_to(self.old_dir)
+        except ValueError:
+            return
+
+        cur = self.old_dir
+        for part in rel.parts:
+            cur = cur / part
+            try:
+                if cur.is_dir():
+                    continue
+                if cur.exists() or cur.is_symlink():
+                    self._log(f"目标位置被同名文件占用，先移除: {cur.name}", "info")
+                    self._remove_path(cur)
+                cur.mkdir()
+            except OSError:
+                continue
+
     def do_update(self, changes: Optional[Dict] = None) -> Tuple[bool, str, str]:
         """
         执行更新
@@ -1870,14 +2291,31 @@ class SimpleUpdater:
                 self._progress(processed, total_ops, f"保留: {rel_path}")
                 continue
 
+            # 用户数据（存档 / 截图 / 小地图 等）永远不写入
+            if self._match_user_data(rel_path):
+                self._progress(processed, total_ops, f"跳过用户数据: {rel_path}")
+                continue
+
             try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
+                # 旧包这个位置是「目录」、新包变成了「文件」→ 先清掉目录
+                # （目录里的内容已经在本次备份里，可以回退）
+                if dst.is_dir():
+                    self._log(f"结构变化，移除旧的同名目录: {rel_path}", "info")
+                    self._remove_path(dst)
+                # 父级链路上如果有同名文件挡路，先移除再建目录
+                self._ensure_parent_dir(dst.parent)
                 shutil.copy2(src, dst)
             except (IOError, OSError) as e:
                 self._log(f"复制失败 {rel_path}: {e}", "error")
+                hint = ""
+                if len(str(dst)) > 240:
+                    hint = (
+                        "\n提示：这个路径很长，可能是 Windows 的 260 字符路径长度限制导致。"
+                        "\n建议把整合包放到层级更浅的目录（例如 D:\\MC\\）后重试。"
+                    )
                 return (
                     False,
-                    f"更新失败: {rel_path}\n原因: {e}\n\n"
+                    f"更新失败: {rel_path}\n原因: {e}{hint}\n\n"
                     f"已经更新过的文件可能处于「半更新」状态，"
                     f"可以在「版本回退」里回退到 {backup_name} 恢复。",
                     backup_name,
@@ -1890,17 +2328,16 @@ class SimpleUpdater:
             processed += 1
             dst = self.old_dir / rel_path
 
-            # 保留文件不删
-            if self._match_preserve(rel_path):
+            # 保留文件 / 用户数据不删
+            if self._match_preserve(rel_path) or self._match_user_data(rel_path):
                 self._progress(processed, total_ops, f"保留: {rel_path}")
                 continue
 
-            if dst.exists():
-                try:
-                    dst.unlink()
+            # 只删文件：如果这里已经变成目录（新旧结构不一样），交给空目录清理，
+            # 免得把刚拷进去的新内容删掉
+            if dst.is_file() or dst.is_symlink():
+                if self._remove_path(dst):
                     self._log(f"删除: {rel_path}", "info")
-                except IOError as e:
-                    self._log(f"删除失败 {rel_path}: {e}", "warning")
 
             self._progress(processed, total_ops, f"删除: {rel_path}")
 
@@ -1917,13 +2354,21 @@ class SimpleUpdater:
         except OSError:
             pass
 
+        user_added = changes.get("user_added", []) or []
+        if user_added:
+            self._log(f"保留了你手动添加的 {len(user_added)} 个文件（不会删除）", "info")
+
         self._progress(total_ops, total_ops, "更新完成!")
         self._log(
-            f"更新完成! 新增 {len(added)}，修改 {len(modified)}，删除 {len(removed)}",
+            f"更新完成! 新增 {len(added)}，修改 {len(modified)}，删除 {len(removed)}"
+            + (f"，保留手加文件 {len(user_added)}" if user_added else ""),
             "info"
         )
 
-        return True, f"更新成功！已备份到 {backup_name}", backup_name
+        msg = f"更新成功！已备份到 {backup_name}"
+        if user_added:
+            msg += f"\n（保留了你手动添加的 {len(user_added)} 个文件）"
+        return True, msg, backup_name
 
     def rollback(self, backup_name: str) -> Tuple[bool, str]:
         """
@@ -1958,12 +2403,9 @@ class SimpleUpdater:
         self._log(f"删除新增文件: {len(added_files)} 个", "info")
         for rel_path in added_files:
             dst = self.old_dir / rel_path
-            if dst.exists() and dst.is_file():
-                try:
-                    dst.unlink()
+            if dst.is_file() or dst.is_symlink():
+                if self._remove_path(dst):
                     self._log(f"删除新增文件: {rel_path}", "info")
-                except IOError as e:
-                    self._log(f"删除失败 {rel_path}: {e}", "warning")
 
         # 2. 恢复被修改的文件（从 modified_files 备份）
         modified_backup_dir = backup_path / "modified_files"
@@ -2063,8 +2505,7 @@ class SimpleUpdater:
                 if rel_path in added_files:
                     # 新增的文件：删除它
                     dst = self.old_dir / rel_path
-                    if dst.exists() and dst.is_file():
-                        dst.unlink()
+                    if (dst.is_file() or dst.is_symlink()) and self._remove_path(dst):
                         success_count += 1
                         self._log(f"回退（删除新增）: {rel_path}", "info")
 
@@ -2103,12 +2544,20 @@ class SimpleUpdater:
         return True, f"已回退 {success_count} 个文件", success_count
 
     def _clean_empty_dirs(self):
-        """清理空目录"""
+        """清理空目录（保留目录 / 用户数据目录一律不动）"""
         for root, dirs, files in os.walk(self.old_dir, topdown=False):
             root_path = Path(root)
             if ".updater" in root_path.parts:
                 continue
             if root_path == self.old_dir:
+                continue
+            try:
+                rel = str(root_path.relative_to(self.old_dir)).replace("\\", "/")
+            except ValueError:
+                continue
+            # 用户自己放东西的目录、用户数据目录，即使是空的也不删
+            if self._match_preserve(rel) or self._match_preserve(rel + "/") \
+                    or self._match_user_data(rel) or self._match_user_data(rel + "/"):
                 continue
             try:
                 if not any(root_path.iterdir()):

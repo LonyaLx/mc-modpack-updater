@@ -1281,6 +1281,58 @@ class SimpleUpdaterApp:
         self.detail_text.insert(tk.END, f"   新版本文件数: {changes.get('new_count', 0)}\n")
         self.detail_text.insert(tk.END, f"   下载大小: {format_size(changes.get('total_size', 0))}\n")
 
+        # 目录自动识别结果（"目录选错"是最大的坑，这里明确写出来让用户核对）
+        old_note = changes.get("old_root_note") or ""
+        new_note = changes.get("new_root_note") or ""
+        if old_note or new_note:
+            self.detail_text.insert(tk.END, "\n// ======== 目录识别 ========\n", "title")
+            if old_note:
+                self.detail_text.insert(tk.END, f"   本地: {old_note}\n")
+            if new_note:
+                self.detail_text.insert(tk.END, f"   新版: {new_note}\n")
+            self.detail_text.insert(
+                tk.END,
+                "   ⚠ 如果上面的目录不对，请重新选择（目录选错会导致大量文件被删）\n",
+                "warn"
+            )
+
+        # 玩家自己加的文件（有基准记录时不会被删除）
+        user_added = changes.get("user_added", []) or []
+        if user_added:
+            self.detail_text.insert(
+                tk.END,
+                f"\n// ======== 你自己添加的文件（{len(user_added)} 个，不会删除）========\n",
+                "preserve"
+            )
+            for f in user_added[:10]:
+                self.detail_text.insert(tk.END, f"     {f}\n")
+            if len(user_added) > 10:
+                self.detail_text.insert(tk.END, f"     ... 还有 {len(user_added) - 10} 个\n")
+            self.detail_text.insert(tk.END, "\n")
+        elif not changes.get("has_baseline", True) and removed and changes.get("delete_removed", True):
+            self.detail_text.insert(
+                tk.END,
+                "// ⚠ 首次更新这个整合包，还没有基准记录，\n"
+                "//   无法区分「整合包自带」和「你手动添加」的文件。\n"
+                "//   本次会删除旧文件（包括你手动添加的模组）。\n"
+                "//   想保留请取消勾选「删除新版本中没有的旧文件」。\n\n",
+                "warn"
+            )
+
+        # 你自己放的东西（资源包 / 光影等），整合包同名文件不会覆盖
+        kept_existing = changes.get("kept_existing", []) or []
+        if kept_existing:
+            self.detail_text.insert(
+                tk.END,
+                f"\n// ======== 你放在这些目录里的文件（{len(kept_existing)} 个，不会被覆盖）========\n",
+                "preserve"
+            )
+            for f in kept_existing[:10]:
+                self.detail_text.insert(tk.END, f"     {f}\n")
+            if len(kept_existing) > 10:
+                self.detail_text.insert(tk.END, f"     ... 还有 {len(kept_existing) - 10} 个\n")
+            self.detail_text.insert(tk.END, "\n")
+
         # Modrinth 整合包信息
         mp = changes.get("mrpack")
         if mp:
