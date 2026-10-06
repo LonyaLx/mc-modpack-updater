@@ -291,6 +291,67 @@ except ValueError as e:
     check("同名同大小但内容不同 → 不复用（走下载）", "下载失败" in str(e), str(e)[:60])
 check("不可复用时旧文件没被改坏", (oldr2 / "mods" / "a.jar").read_bytes() == CONTENT_A)
 
+print("\n[9] 新版本包里没有模组文件时怎么处理")
+cf_work = work / "cfonly"
+cf_work.mkdir()
+oldcf = cf_work / "old"
+(oldcf / "mods").mkdir(parents=True)
+(oldcf / "config").mkdir(parents=True)
+(oldcf / "mods" / "keep.jar").write_bytes(b"KEEP")
+(oldcf / "config" / "c.toml").write_text("v1", encoding="utf-8")
+
+CF_FILES = [{"projectID": 238222, "fileID": 4593541, "required": True},
+            {"projectID": 306770, "fileID": 5100000, "required": False}]
+
+
+def _cf_manifest(files):
+    return json.dumps({
+        "minecraft": {"version": "1.21.1",
+                      "modLoaders": [{"id": "neoforge-21.1.0", "primary": True}]},
+        "manifestType": "minecraftModpack", "manifestVersion": 1,
+        "name": "自检包", "version": "1.0", "files": files, "overrides": "overrides",
+    }, ensure_ascii=False)
+
+
+# ① CurseForge 清单包：只有 manifest.json + overrides，没有 mods → 必须拦住
+z_cf = cf_work / "清单包.zip"
+with zipfile.ZipFile(z_cf, "w") as zf:
+    zf.writestr("manifest.json", _cf_manifest(CF_FILES))
+    zf.writestr("overrides/config/c.toml", b"v2")
+cf_logs = []
+try:
+    SimpleUpdater(str(oldcf), str(z_cf), log_callback=lambda m, l="info": cf_logs.append(m))
+    check("CurseForge 清单包被拦住", False, "没有报错")
+except ValueError as e:
+    t = str(e)
+    cls_log = "\n".join(cf_logs)
+    check("CurseForge 清单包被拦住", "清单包" in t, t.splitlines()[0])
+    check("弹窗说明 CurseForge 需要密钥、工具补不了", "密钥" in t)
+    check("弹窗直接给了最省事的办法", "最省事的办法" in t and "用启动器" in t)
+    check("日志里给出 3 种出路（启动器 / 完整包 / 手动补）",
+          "用启动器装一次" in cls_log and "完整包" in cls_log and "projectID" in cls_log)
+check("生成了「需要手动补的模组清单」文件",
+      (cf_work / "清单包.需要手动补的模组清单.txt").is_file())
+
+# ② 同格式但模组已打全（第三方重打包）→ 正常放行
+z_full = cf_work / "完整重打包.zip"
+with zipfile.ZipFile(z_full, "w") as zf:
+    zf.writestr("manifest.json", _cf_manifest(CF_FILES))
+    zf.writestr("overrides/mods/full.jar", b"FULL")
+up_full = SimpleUpdater(str(oldcf), str(z_full))
+ch_full = up_full.compare()
+check("模组打全的 CurseForge 包正常放行", "mods/full.jar" in ch_full["added"], ch_full["added"])
+
+# ③ 完全没有整合包内容的目录 → 拦住（避免把旧包清空）
+empty_dir = cf_work / "空目录"
+empty_dir.mkdir()
+try:
+    SimpleUpdater(str(oldcf), str(empty_dir))
+    check("空目录被拦住", False, "没有报错")
+except ValueError as e:
+    check("空目录被拦住", "没找到任何整合包内容" in str(e))
+check("被拦住时旧包没被改动", (oldcf / "mods" / "keep.jar").read_bytes() == b"KEEP")
+
 print("\n==== 结果 ====")
 if FAIL:
     print(f"失败 {len(FAIL)} 项：")

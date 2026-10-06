@@ -717,6 +717,101 @@ def _extract_zip_to_temp(zip_path: Path, log_callback=None, progress_callback=No
     return _prepare_new_pack(zip_path, log_callback, progress_callback)[0]
 
 
+# ==================== CurseForge「清单包」识别 ====================
+#
+# CurseForge 规定：客户端整合包里的模组不能直接塞进 mods/，必须在 manifest.json
+# 里用 projectID / fileID 引用，由启动器联网下载。所以从 CurseForge 官方下载的
+# 客户端包通常是「只有 manifest.json + overrides、没有 mods」的清单包。
+#
+# 这种包本工具补不了：
+#   1) CurseForge 官方 API 需要按应用申请的密钥（不能随工具分发）
+#   2) 官方公告已明确：CDN 直链下载自 2026-07-16 起也需要密钥，无密钥返回 401
+# 所以这里只做「准确识别 + 提前拦住」，并给用户可执行的出路。
+
+def _find_curseforge_manifest(root: Path) -> Optional[Dict]:
+    """在解压结果（或其下一层）里找 CurseForge 格式的 manifest.json"""
+    candidates = [root / "manifest.json"]
+    try:
+        for child in root.iterdir():
+            if child.is_dir():
+                candidates.append(child / "manifest.json")
+    except OSError:
+        pass
+    for cand in candidates:
+        try:
+            if not cand.is_file():
+                continue
+            data = json.loads(cand.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        # 必须同时有 files 列表和 minecraft 段，才算 CurseForge 清单
+        if isinstance(data, dict) and isinstance(data.get("files"), list) and "minecraft" in data:
+            return data
+    return None
+
+
+def _count_pack_files(root: Path, subdir: str = "mods") -> int:
+    """统计整合包里某个子目录下的文件数（递归）"""
+    base = root / subdir
+    if not base.is_dir():
+        return 0
+    count = 0
+    try:
+        for p in base.rglob("*"):
+            if p.is_file():
+                count += 1
+    except OSError:
+        pass
+    return count
+
+
+def _write_missing_mods_list(target: Path, source_name: str, cf: Dict,
+                             local_mods: int) -> Optional[Path]:
+    """把「清单里声明但压缩包里没有的文件」写成一份可操作的清单文件"""
+    files = [f for f in (cf.get("files") or []) if isinstance(f, dict)]
+    mc = cf.get("minecraft") or {}
+    loaders = "、".join(
+        str(l.get("id")) for l in (mc.get("modLoaders") or []) if isinstance(l, dict)
+    )
+    lines = [
+        "MC 整合包更新器 —— 需要手动补的模组清单",
+        "=" * 46,
+        f"来源包：{source_name}",
+        f"Minecraft：{mc.get('version', '未知')}    加载器：{loaders or '未知'}",
+        f"清单声明的文件数：{len(files)}    压缩包里实际有的模组数：{local_mods}",
+        "",
+        "【为什么需要手动补】",
+        "这个压缩包是 CurseForge 的「清单包」：里面只有 manifest.json 和 overrides，",
+        "模组本身不在包里，按 CurseForge 规定必须由启动器联网下载。",
+        "而 CurseForge 现在要求 API 密钥才能下载文件，第三方工具拿不到，",
+        "所以本更新器无法自动帮你补齐。",
+        "",
+        "【怎么解决，任选一种】",
+        "1) 用启动器装一次（最推荐）",
+        "   在 CurseForge App / Prism Launcher / HMCL / PCL 里导入这个压缩包，",
+        "   让它把模组下载好，得到一个完整实例；",
+        "   然后把「本地旧整合包」选成那个新装好的实例目录，更新就正常了。",
+        "2) 换一份完整包",
+        "   找整合包作者要「包含 mods 的完整包」，或直接下服务端包",
+        "   （CurseForge 的服务端包通常已经把全部模组打包在里面）。",
+        "3) 自己按下面的清单去补",
+        "   逐个下载后放进 mods/ 文件夹，再重新检测。",
+        "",
+        "【需要补齐的文件（projectID / fileID）】",
+    ]
+    for i, item in enumerate(files, 1):
+        pid = item.get("projectID", "?")
+        fid = item.get("fileID", "?")
+        req = "必需" if item.get("required", True) else "可选"
+        lines.append(f"{i:>4}. projectID={pid}  fileID={fid}  ({req})"
+                     f"    https://www.curseforge.com/projects/{pid}")
+    lines.append("")
+    try:
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return target
+    except OSError:
+        return None
+
 
 class SimpleUpdater:
     """简化版整合包更新器"""
@@ -1024,11 +1119,12 @@ class SimpleUpdater:
         # 兜底提示：下钻完还是找不到整合包特征，说明目录多半选错了
         try:
             if current.is_dir() and not cls._looks_like_pack_root(current):
-                if (current / "manifest.json").is_file():
+                cf = _find_curseforge_manifest(directory)
+                if cf is not None:
+                    declared = len([f for f in (cf.get("files") or []) if isinstance(f, dict)])
                     notes.append(
-                        "检测到 CurseForge 的 manifest.json，但压缩包里没有 mods/。"
-                        "这是「只含清单」的整合包，模组需要从 CurseForge 下载，"
-                        "本工具无法自动获取，请改用「包含 mods 的完整整合包」"
+                        f"这个压缩包是 CurseForge「清单包」：manifest.json 里声明了 "
+                        f"{declared} 个模组，但包里没有 mods/（模组要由启动器联网下载）"
                     )
                 else:
                     notes.append("没找到 mods/ 或 config/，请确认选择的是整合包目录")
@@ -1036,6 +1132,91 @@ class SimpleUpdater:
             pass
 
         return current, "；".join(notes)
+
+    def _guard_new_pack(self, prepared_root: Path, requested_new: Path):
+        """
+        新版本包如果根本没有整合包内容（或只是 CurseForge「清单包」），
+        继续 compare 只会把旧包的模组统统判成「删除」，必须先拦住并说清怎么办。
+        """
+        # ① CurseForge 清单包：manifest.json 声明了模组，但包里一个都没有
+        cf = _find_curseforge_manifest(prepared_root)
+        if cf is not None:
+            declared = [f for f in (cf.get("files") or []) if isinstance(f, dict)]
+            local_mods = _count_pack_files(self.new_dir, "mods")
+            if declared and local_mods == 0:
+                out_path = None
+                try:
+                    stem = requested_new.stem if requested_new.is_file() else requested_new.name
+                    out_path = _write_missing_mods_list(
+                        requested_new.parent / f"{stem}.需要手动补的模组清单.txt",
+                        requested_new.name, cf, local_mods,
+                    )
+                except OSError:
+                    out_path = None
+
+                # 详细说明写进日志（界面上的日志区可以滚动），弹窗只给精简版
+                detail_lines = [
+                    "⚠ 这个压缩包是 CurseForge 的「清单包」，里面没有模组文件",
+                    f"   manifest.json 声明了 {len(declared)} 个模组，但包里的 mods/ 是空的",
+                    "   按 CurseForge 规定，这些模组必须由启动器联网下载；",
+                    "   而 CurseForge 现在下载文件需要 API 密钥，第三方工具拿不到，",
+                    "   所以本工具没法自动补齐，只能先拦住更新（否则会把旧包模组全删掉）。",
+                    "",
+                    "怎么办（任选一种）：",
+                    "  1) 用启动器装一次（最推荐）",
+                    "     把压缩包导入 CurseForge App / Prism Launcher / HMCL / PCL，",
+                    "     让它把模组下载好，再把「本地旧整合包」选成那个新装好的实例目录。",
+                    "  2) 换一份完整包",
+                    "     找整合包作者要「包含 mods 的完整包」，或直接下服务端包",
+                    "     （CurseForge 的服务端包通常已经把全部模组打包在里面）。",
+                    "  3) 自己按清单补",
+                    "     清单里列了每个模组的 projectID / fileID，逐个下载放进 mods/。",
+                ]
+                if out_path:
+                    detail_lines += ["", f"需要补齐的模组清单：{out_path}"]
+                self._log(detail_lines[0], "error")
+                for line in detail_lines[1:]:
+                    self._log(line, "info")
+
+                raise ValueError(
+                    f"这是 CurseForge 的「清单包」：manifest.json 声明了 {len(declared)} 个模组，\n"
+                    "但包里没有 mods/ 文件夹，这些模组必须由启动器联网下载。\n"
+                    "而 CurseForge 现在下载文件要 API 密钥，本工具没法自动补齐，"
+                    "已先拦住更新（不会动你的旧模组）。\n\n"
+                    "最省事的办法：用启动器（CurseForge App / Prism / HMCL / PCL）\n"
+                    "把这个包装一遍，再把「本地旧整合包」选成那个装好的完整实例目录。\n\n"
+                    "完整说明和 3 种解决办法见下方运行日志；\n"
+                    "需要补齐的模组清单已生成在压缩包旁边。"
+                )
+            elif declared and local_mods < len(declared):
+                self._log(
+                    f"注意：manifest.json 声明了 {len(declared)} 个模组，"
+                    f"但包里只有 {local_mods} 个，可能有模组缺失"
+                    f"（缺的那些会被当成「新版本里没有」而删除）",
+                    "warning"
+                )
+
+        # ② Modrinth 整合包的内容是按清单组装出来的，已经校验过；
+        #    清单本身为空属于正常情况，不再按「没有内容」拦截
+        if self.mrpack_meta is not None:
+            return
+
+        # ③ 新包里完全没有整合包内容（选错目录 / 没下载解压完整）
+        try:
+            has_content = self._looks_like_pack_root(self.new_dir)
+        except OSError:
+            has_content = False
+        if not has_content:
+            raise ValueError(
+                f"新版本里没找到任何整合包内容：\n{self.new_dir}\n\n"
+                "既没有 mods/，也没有 config/ 之类的整合包目录，继续更新会把旧包清空，"
+                "所以先拦住了。\n\n"
+                "常见原因：\n"
+                "  · 目录选错了（选到了上一级，或直接选了压缩包本身）\n"
+                "  · 压缩包没下载完整 / 解压不完整\n"
+                "  · 这是个 CurseForge「清单包」，模组要由启动器联网下载\n\n"
+                "请确认后重新选择「新版本整合包」。"
+            )
 
     def __init__(self, old_dir: str, new_dir: str,
                  progress_callback: Optional[Callable] = None,
@@ -1070,8 +1251,9 @@ class SimpleUpdater:
 
         # 新版本支持直接选择压缩包：
         #   - .zip    普通整合包，自动解压
-        #   - .mrpack Modrinth 整合包，自动下载清单里声明的模组
+        #   - .mrpack Modrinth 整合包，自动准备清单里声明的模组
         self.mrpack_meta: Optional[dict] = None
+        requested_new = Path(new_dir).expanduser()
         new_path = Path(new_dir).resolve()
         if new_path.is_file() and new_path.suffix.lower() in ARCHIVE_SUFFIXES:
             new_path, self.mrpack_meta = _prepare_new_pack(
@@ -1083,6 +1265,9 @@ class SimpleUpdater:
 
         # 自动识别整合包真实根目录（CurseForge overrides 外壳 / 启动器版本隔离）
         self.new_dir, self._new_root_note = self._resolve_pack_root(new_path)
+
+        # 新包压根没有模组内容时必须提前拦住，否则 compare 会把旧包模组全判为删除
+        self._guard_new_pack(new_path, requested_new)
 
         self.preserve_config = preserve_config
         self.delete_removed = delete_removed
