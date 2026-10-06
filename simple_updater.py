@@ -325,10 +325,20 @@ def _find_mrpack_index(root: Path) -> Optional[Path]:
 
 
 def _download_mrpack_files(files: List[dict], target_root: Path,
-                           log_callback=None, progress_callback=None) -> Dict:
+                           log_callback=None, progress_callback=None,
+                           reuse_root: Optional[Path] = None) -> Dict:
     """
-    按 Modrinth 清单并发下载所有声明文件到 target_root。
-    :return: {"ok": [...], "failed": [...], "skipped": [...], "missing": [...]}
+    按 Modrinth 清单把所有声明文件准备到 target_root。
+
+    获取顺序（尽量不联网）：
+      1. target_root 里已经有了 → 直接用
+      2. 旧整合包（reuse_root）里已经有内容完全一致的文件 → 直接复用，不下载
+      3. 命中上次的下载缓存 → 直接复用
+      4. 以上都不行才联网下载
+
+    :param reuse_root: 旧整合包根目录（用来免下载）
+    :return: {"ok", "failed", "skipped", "missing", "reasons",
+              "reused_local", "reused_cache", "downloaded"}
     """
     log = log_callback or (lambda *a: None)
     progress = progress_callback or (lambda *a: None)
@@ -356,18 +366,20 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
 
     total = len(todo)
     if total == 0:
-        return {"ok": [], "failed": [], "skipped": skipped, "missing": [], "reasons": {}}
+        return {"ok": [], "failed": [], "skipped": skipped, "missing": [],
+                "reasons": {}, "reused_local": 0, "reused_cache": 0, "downloaded": 0}
 
     total_bytes = sum(int(i.get("fileSize") or 0) for i in todo)
-    log(f"开始下载清单资源：{total} 个文件，约 {format_size(total_bytes)}", "info")
-    log(f"下载缓存目录：{cache_dir}（缓存上限 2GB，超出会自动清理最旧的）", "info")
-    _enforce_mrpack_cache_limit()
+    log(f"清单共 {total} 个文件，约 {format_size(total_bytes)}"
+        f"（会先检查旧整合包和下载缓存，能复用的不重复下载）", "info")
 
     done_files = 0
     done_bytes = 0
     ok: List[str] = []
     failed: List[str] = []
     reasons: Dict[str, str] = {}
+    counters = {"local": 0, "cache": 0, "exists": 0, "downloaded": 0}
+    reuse_bytes = 0
     lock = threading.Lock()
 
     def one(item: dict):
@@ -379,23 +391,37 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
             sha1 = ""
         size = int(item.get("fileSize") or 0)
 
-        # 1) 目标已存在且校验通过 → 跳过
+        # 1) 目标位置已经有且校验通过 → 跳过
         if dest.is_file() and sha1 and _file_sha1(dest) == sha1:
-            return True, rel, size, ""
+            return True, rel, size, "", "exists"
 
-        # 2) 命中本地下载缓存
+        # 2) 旧整合包里已经有内容完全一样的文件 → 直接复用（硬链接，秒完成、不占额外空间）
+        #    这是最省事的一步：大部分模组在两个版本之间根本没变
+        if reuse_root is not None and sha1:
+            local = reuse_root / rel
+            try:
+                if local.is_file():
+                    # 先用清单里的大小快速排除（大小都不一样就不用算了）
+                    if not size or local.stat().st_size == size:
+                        if _file_sha1(local) == sha1:
+                            _link_or_copy(local, dest)
+                            return True, rel, size, "", "local"
+            except OSError:
+                pass
+
+        # 3) 命中上次的下载缓存
         cache_file = (cache_dir / sha1) if sha1 else None
         if cache_file is not None and cache_file.is_file():
-            if (not sha1) or _file_sha1(cache_file) == sha1:
-                try:
+            try:
+                if _file_sha1(cache_file) == sha1:
                     _link_or_copy(cache_file, dest)
-                    return True, rel, size, ""
-                except OSError:
-                    pass
+                    return True, rel, size, "", "cache"
+            except OSError:
+                pass
 
         urls = [u for u in (item.get("downloads") or []) if u]
         if not urls:
-            return False, rel, size, "清单未提供下载地址"
+            return False, rel, size, "清单未提供下载地址", ""
 
         last_err = ""
         for attempt in range(3):
@@ -415,8 +441,12 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
                             shutil.copy2(dest, cache_file)
                     except OSError:
                         pass
-                return True, rel, size, ""
-        return False, rel, size, last_err or "下载失败"
+                return True, rel, size, "", "downloaded"
+        return False, rel, size, last_err or "下载失败", ""
+
+    # 真正需要联网前，先把下载缓存控制在 2GB 以内
+    _enforce_mrpack_cache_limit()
+    log(f"下载缓存目录：{cache_dir}（缓存上限 2GB，超出自动清理最旧的）", "info")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as pool:
         future_map = {pool.submit(one, item): item for item in todo}
@@ -425,8 +455,9 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
             rel = str(item.get("path") or "").replace("\\", "/")
             size = int(item.get("fileSize") or 0)
             reason = ""
+            source = ""
             try:
-                success, rel, size, reason = fut.result()
+                success, rel, size, reason, source = fut.result()
             except Exception as e:
                 log(f"下载异常 {rel}: {e}", "warning")
                 success = False
@@ -437,6 +468,10 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
                 done_bytes += size
                 if success:
                     ok.append(rel)
+                    if source in counters:
+                        counters[source] += 1
+                    if source in ("local", "cache", "exists"):
+                        reuse_bytes += size
                 else:
                     failed.append(rel)
                     reasons[rel] = reason
@@ -450,7 +485,14 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
                              f"下载整合包资源 {done_files}/{total}：{Path(rel).name}")
 
     level = "info" if not failed else "warning"
-    log(f"资源下载完成：成功 {len(ok)} 个，失败 {len(failed)} 个", level)
+    log(f"资源准备完成：成功 {len(ok)} 个，失败 {len(failed)} 个", level)
+    log(
+        f"其中 复用旧整合包 {counters['local']} 个"
+        f"、命中下载缓存 {counters['cache']} 个"
+        f"、实下载 {counters['downloaded']} 个"
+        + (f"，共省下约 {format_size(reuse_bytes)} 下载量" if reuse_bytes else ""),
+        "info"
+    )
 
     # 校验清单里声明但最终缺失的文件（通常是清单自带、或下载失败）
     missing = []
@@ -460,16 +502,22 @@ def _download_mrpack_files(files: List[dict], target_root: Path,
             missing.append(rel)
 
     return {"ok": ok, "failed": failed, "skipped": skipped,
-            "missing": missing, "reasons": reasons}
+            "missing": missing, "reasons": reasons,
+            "reused_local": counters["local"],
+            "reused_cache": counters["cache"],
+            "reused_bytes": reuse_bytes,
+            "downloaded": counters["downloaded"]}
 
 
 def _assemble_mrpack(raw_root: Path, index_file: Path,
                      log_callback=None, progress_callback=None,
-                     base_hint: Optional[Path] = None) -> Tuple[Path, Dict]:
+                     base_hint: Optional[Path] = None,
+                     reuse_root: Optional[Path] = None) -> Tuple[Path, Dict]:
     """
     把 Modrinth 整合包组装成一个完整的整合包根目录：
-      overrides/ + client-overrides/ 内容 + 清单里声明的全部资源（联网下载）
+      overrides/ + client-overrides/ 内容 + 清单里声明的全部资源
     :param base_hint: 整合包所在目录，用于把临时文件放到同一个盘符（省系统盘空间）
+    :param reuse_root: 旧整合包目录；里面已有的相同文件直接复用，不重复下载
     :return: (整合包根目录, 清单元信息)
     """
     log = log_callback or (lambda *a: None)
@@ -528,7 +576,7 @@ def _assemble_mrpack(raw_root: Path, index_file: Path,
                 log(f"合并 {label} 失败 {item.name}: {e}", "warning")
         log(f"已合并 {label} 内容：{moved} 项", "info")
 
-    # 2) 清单声明的资源（需要联网下载）
+    # 2) 清单声明的资源（旧整合包/缓存里有就复用，没有才联网下载）
     files = data.get("files") or []
     if files:
         # 磁盘空间预检查：避免下载到一半才发现空间不足
@@ -543,7 +591,10 @@ def _assemble_mrpack(raw_root: Path, index_file: Path,
         except OSError:
             pass
 
-        result = _download_mrpack_files(files, merged, log, progress)
+        if reuse_root is not None:
+            log(f"会拿旧整合包对照：已经在旧包里、内容完全一样的模组不用重新下载", "info")
+        result = _download_mrpack_files(files, merged, log, progress,
+                                        reuse_root=reuse_root)
         if result.get("missing"):
             log(f"注意：有 {len(result['missing'])} 个清单文件最终缺失，"
                 f"可能导致游戏启动失败（可重试检测以重新下载）", "warning")
@@ -564,19 +615,26 @@ def _assemble_mrpack(raw_root: Path, index_file: Path,
         "loaders": loaders,
         "file_count": len(files),
     }
+    if files:
+        meta["reused_local"] = int(result.get("reused_local") or 0)
+        meta["reused_cache"] = int(result.get("reused_cache") or 0)
+        meta["reused_bytes"] = int(result.get("reused_bytes") or 0)
+        meta["downloaded"] = int(result.get("downloaded") or 0)
     return merged, meta
 
 
 def _prepare_new_pack(archive: Path, log_callback=None,
                       progress_callback=None,
-                      base_hint: Optional[Path] = None) -> Tuple[Path, Optional[Dict]]:
+                      base_hint: Optional[Path] = None,
+                      reuse_root: Optional[Path] = None) -> Tuple[Path, Optional[Dict]]:
     """
     把“新版本压缩包”处理成可直接对比的整合包根目录：
       - 普通 zip：解压后交给 _resolve_pack_root 继续识别（含套壳 / overrides）
       - Modrinth 整合包（.mrpack 或含 modrinth.index.json 的 zip）：
-        自动下载清单里声明的全部模组，再与 overrides 合并
+        准备清单里声明的资源，再与 overrides 合并
     同一个压缩包只处理一次。
     :param base_hint: 整合包所在目录，临时文件优先放到同一盘符
+    :param reuse_root: 旧整合包目录，里面已有的相同文件不会再下载
     :return: (整合包根目录, Modrinth 元信息或 None)
     """
     log = log_callback or (lambda *a: None)
@@ -636,7 +694,8 @@ def _prepare_new_pack(archive: Path, log_callback=None,
     if index_file is not None:
         index_dir = index_file.parent
         final_root, meta = _assemble_mrpack(index_dir, index_file, log, progress,
-                                            base_hint=base_hint)
+                                            base_hint=base_hint,
+                                            reuse_root=reuse_root)
         _MRPACK_META_CACHE[key] = meta
         # 原始解压目录已经没用了（overrides 已移走）
         try:
@@ -1017,7 +1076,9 @@ class SimpleUpdater:
         if new_path.is_file() and new_path.suffix.lower() in ARCHIVE_SUFFIXES:
             new_path, self.mrpack_meta = _prepare_new_pack(
                 new_path, self.log_callback, self.progress_callback,
-                base_hint=self.old_dir
+                base_hint=self.old_dir,
+                # 旧整合包里已经有的模组直接复用，不重复下载
+                reuse_root=self.old_dir,
             )
 
         # 自动识别整合包真实根目录（CurseForge overrides 外壳 / 启动器版本隔离）

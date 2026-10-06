@@ -11,6 +11,7 @@
 全部通过会打印「全部通过」，否则列出失败项并以非 0 退出码结束。
 """
 import json
+import shutil
 import struct
 import sys
 import tempfile
@@ -219,6 +220,76 @@ check("_fix_zip_name 还原 GBK 中文名",
 check("_fix_zip_name 不影响普通英文 / 西文名",
       _fix_zip_name("Pokemon/mods/a.jar", 0) == "Pokemon/mods/a.jar"
       and _fix_zip_name("Pokémon/a.jar", 0) == "Pokémon/a.jar")
+
+print("\n[8] .mrpack 更新时复用旧整合包里已有的模组（不重复下载）")
+import hashlib  # noqa: E402
+
+
+def _sha1(data):
+    return hashlib.sha1(data).hexdigest()
+
+
+def _make_mrpack(path, files, overrides=None):
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("modrinth.index.json", json.dumps({
+            "name": "自检包", "versionId": "1.0",
+            "dependencies": {"minecraft": "1.21.1", "neoforge": "21.1.0"},
+            "files": files,
+        }, ensure_ascii=False))
+        for arc, data in (overrides or {}).items():
+            zf.writestr(arc, data)
+
+
+DEAD = "http://127.0.0.1:9/unreachable.jar"     # 不可达：一旦真的去下载就会失败
+
+rwork = work / "reuse"
+rwork.mkdir()
+oldr = rwork / "old"
+(oldr / "mods").mkdir(parents=True)
+(oldr / "config").mkdir(parents=True)
+CONTENT_A = b"MOD-A" + b"a" * 400
+CONTENT_B = b"MOD-B" + b"b" * 700
+(oldr / "mods" / "a.jar").write_bytes(CONTENT_A)
+(oldr / "mods" / "b.jar").write_bytes(CONTENT_B)
+(oldr / "config" / "c.toml").write_text("v1", encoding="utf-8")
+
+mp = rwork / "reuse.mrpack"
+_make_mrpack(mp, [
+    {"path": "mods/a.jar", "hashes": {"sha1": _sha1(CONTENT_A)},
+     "fileSize": len(CONTENT_A), "downloads": [DEAD]},
+    {"path": "mods/b.jar", "hashes": {"sha1": _sha1(CONTENT_B)},
+     "fileSize": len(CONTENT_B), "downloads": [DEAD]},
+], overrides={"overrides/config/c.toml": b"v2"})
+
+upr = SimpleUpdater(str(oldr), str(mp))
+mpr = upr.mrpack_meta or {}
+check("旧包里已有的模组被复用（2 个）", mpr.get("reused_local") == 2, mpr)
+check("全部复用 → 一个都不需要下载", mpr.get("downloaded") == 0, mpr)
+check("省下的下载量统计正确", mpr.get("reused_bytes") == len(CONTENT_A) + len(CONTENT_B), mpr)
+chr_ = upr.compare()
+check("内容一致的模组不算「要更新」",
+      not [q for q in chr_["added"] + chr_["modified"] if q.startswith("mods/")],
+      chr_["added"] + chr_["modified"])
+okr, _, _ = upr.do_update(chr_)
+check("完全离线也能完成更新", okr)
+check("复用后旧包文件内容完好", (oldr / "mods" / "a.jar").read_bytes() == CONTENT_A
+      and (oldr / "mods" / "b.jar").read_bytes() == CONTENT_B)
+
+# 同名、同大小但内容不同 → 必须靠哈希判定为不可复用（会去下载并失败）
+oldr2 = rwork / "old2"
+shutil.copytree(oldr, oldr2)
+SAME_LEN_OTHER = b"XXXXXX" + b"z" * (len(CONTENT_A) - 6)
+mp2 = rwork / "diff.mrpack"
+_make_mrpack(mp2, [
+    {"path": "mods/a.jar", "hashes": {"sha1": _sha1(SAME_LEN_OTHER)},
+     "fileSize": len(SAME_LEN_OTHER), "downloads": [DEAD]},
+], overrides={})
+try:
+    SimpleUpdater(str(oldr2), str(mp2))
+    check("同名同大小但内容不同 → 不复用", False, "被错误复用了")
+except ValueError as e:
+    check("同名同大小但内容不同 → 不复用（走下载）", "下载失败" in str(e), str(e)[:60])
+check("不可复用时旧文件没被改坏", (oldr2 / "mods" / "a.jar").read_bytes() == CONTENT_A)
 
 print("\n==== 结果 ====")
 if FAIL:

@@ -1142,9 +1142,20 @@ class SimpleUpdaterApp:
             mp = changes["mrpack"]
             self._log(
                 f"✓ Modrinth 整合包：{mp.get('name', '')} {mp.get('version_id', '')}"
-                f"，已自动获取 {mp.get('file_count', 0)} 个清单资源",
+                f"，清单共 {mp.get('file_count', 0)} 个资源",
                 "info"
             )
+            reused_local = mp.get("reused_local", 0) or 0
+            reused_cache = mp.get("reused_cache", 0) or 0
+            downloaded = mp.get("downloaded", 0) or 0
+            reused_bytes = mp.get("reused_bytes", 0) or 0
+            if reused_local or reused_cache:
+                self._log(
+                    f"  复用旧整合包 {reused_local} 个、下载缓存 {reused_cache} 个，"
+                    f"实际只需下载 {downloaded} 个"
+                    + (f"（省下约 {format_size(reused_bytes)}）" if reused_bytes else ""),
+                    "info"
+                )
 
         # NeoForge 版本检测：根据状态给出对应提示
         nf = changes.get("neoforge", {})
@@ -1348,9 +1359,22 @@ class SimpleUpdaterApp:
                 )
             self.detail_text.insert(
                 tk.END,
-                f"   ✓ 已自动下载清单资源 {mp.get('file_count', 0)} 个\n",
+                f"   ✓ 已准备清单资源 {mp.get('file_count', 0)} 个\n",
                 "preserve"
             )
+            reused_local = mp.get("reused_local", 0) or 0
+            reused_cache = mp.get("reused_cache", 0) or 0
+            downloaded = mp.get("downloaded", 0) or 0
+            reused_bytes = mp.get("reused_bytes", 0) or 0
+            if reused_local or reused_cache or downloaded:
+                self.detail_text.insert(
+                    tk.END,
+                    f"      · 从旧整合包直接复用: {reused_local} 个（无需下载）\n"
+                    f"      · 命中下载缓存: {reused_cache} 个\n"
+                    f"      · 需要联网下载: {downloaded} 个"
+                    + (f"（省下约 {format_size(reused_bytes)}）\n" if reused_bytes else "\n"),
+                    "preserve"
+                )
 
         # NeoForge 版本信息
         nf = changes.get("neoforge", {})
